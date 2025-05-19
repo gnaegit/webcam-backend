@@ -25,10 +25,10 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
    ```bash
    git clone https://github.com/gnaegit/webcam-backend.git
    cd webcam-backend
-   mv webcam-backend /home/pi/Projects/camera-app-fish
+   mv webcam-backend /home/pi/Projects/webcam-backend
    cd /home/pi/Projects/camera-app-fish
    ```
-   - Note: The service expects the project in `/home/pi/Projects/camera-app-fish`.
+   - Note: The service expects the project in `/home/pi/Projects/webcam-backend`.
 
 2. **Set Up Python Environment**:
    - Create and activate a virtual environment:
