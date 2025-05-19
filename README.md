@@ -25,10 +25,10 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
    ```bash
    git clone https://github.com/gnaegit/webcam-backend.git
    cd webcam-backend
-   mv webcam-backend /home/pi/Projects/webcam-backend
-   cd /home/pi/Projects/webcam-backend
+   mv webcam-backend /home/pi/webcam/webcam-backend
+   cd /home/pi/webcam/webcam-backend
    ```
-   - Note: The service expects the project in `/home/pi/Projects/webcam-backend`.
+   - Note: The service expects the project in `/home/pi/webcam/webcam-backend`.
 
 2. **Set Up Python Environment**:
    - Create and activate a virtual environment:
@@ -93,13 +93,13 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
 
      [Service]
      User=pi
-     WorkingDirectory=/home/pi/Projects/webcam-backend
-     ExecStart=/home/pi/Projects/camera-app-fish/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+     WorkingDirectory=/home/pi/webcam/webcam-backend
+     ExecStart=/home/pi/webcam/webcam-backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
      Restart=always
      Environment="PYTHONUNBUFFERED=1"
      Environment="GENICAM_GENTL64_PATH=/usr/lib/ids/cti"
-     Environment="PATH=/home/pi/Projects/webcam-backend/venv/bin:/usr/local/bin:/usr/bin:/bin"
-     Environment="VIRTUAL_ENV=/home/pi/Projects/webcam-backend/venv"
+     Environment="PATH=/home/pi/webcam/webcam-backend/venv/bin:/usr/local/bin:/usr/bin:/bin"
+     Environment="VIRTUAL_ENV=/home/pi/webcam/webcam-backend/venv"
 
      [Install]
      WantedBy=multi-user.target
@@ -209,7 +209,7 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
 
 - **Service Fails**:
   - Check logs: `journalctl -u webcam-backend.service`.
-  - Verify virtual environment: `/home/pi/Projects/webcam-backend/venv`.
+  - Verify virtual environment: `/home/pi/webcam/webcam-backend/venv`.
   - Ensure IDS Peak and dependencies are installed.
 - **Port Conflict**:
   - Check: `sudo lsof -i :8000`.
