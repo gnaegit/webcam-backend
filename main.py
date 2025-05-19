@@ -18,6 +18,7 @@ from pathlib import Path
 import json
 import logging
 import glob
+import shutil  # Added for disk space checking
 
 try:
     from picamera2 import Picamera2
@@ -228,6 +229,11 @@ class JpegStream:
             except Exception as e:
                 logging.error(f"Error in capture callback: {e}")
 
+    def get_available_disk_space(self):
+        """Check available disk space in bytes."""
+        stat = shutil.disk_usage(IMAGES_DIR)
+        return stat.free
+
     async def store_images(self):
         try:
             if not self.camera or not self.camera_type:
@@ -252,6 +258,13 @@ class JpegStream:
             self.create_new_folder()
 
             while self.active_storage:
+                # Check disk space (5GB = 5 * 1024 * 1024 * 1024 bytes)
+                if self.get_available_disk_space() < 5 * 1024 * 1024 * 1024:
+                    logging.warning("Disk space below 5GB, stopping storage")
+                    await self.stop_storage_task()
+                    await self.notify_clients(stop_reason="Insufficient disk space (less than 5GB)")
+                    return
+
                 jpeg_data = await self.output.read()
                 img = cv2.imdecode(np.frombuffer(jpeg_data, np.uint8), cv2.IMREAD_COLOR)
 
@@ -365,10 +378,12 @@ class JpegStream:
                     self.camera.stop_acquisition()
             await self.notify_clients()
 
-    async def notify_clients(self, image_path: str = None):
+    async def notify_clients(self, image_path: str = None, stop_reason: str = None):
         status = self.get_stream_status()
         if image_path:
             status["new_image"] = image_path
+        if stop_reason:
+            status["stop_reason"] = stop_reason
         tasks = [websocket.send_json(status) for websocket in self.connections]
         await asyncio.gather(*tasks, return_exceptions=True)
 
