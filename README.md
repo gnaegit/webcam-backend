@@ -1,1 +1,1 @@
-# camera-app
+# Webcam backend server
