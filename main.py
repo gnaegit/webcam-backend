@@ -74,6 +74,7 @@ class JpegStream:
         self.last_save_time = 0
         self.auto_feature_manager = None
         self.camera_status = {"picamera": False, "cameraids": False}
+        self.max_folder_size = 1_073_741_824  # 1GB in bytes
 
         os.makedirs("images", exist_ok=True)
         self.output = StreamingOutput()
@@ -233,6 +234,14 @@ class JpegStream:
         """Check available disk space in bytes."""
         stat = shutil.disk_usage(IMAGES_DIR)
         return stat.free
+        
+    def get_folder_size(self, folder_path: Path) -> int:
+        """Calculate the total size of a folder in bytes."""
+        total_size = 0
+        for item in folder_path.rglob("*"):
+            if item.is_file():
+                total_size += item.stat().st_size
+        return total_size
 
     async def store_images(self):
         try:
@@ -265,6 +274,12 @@ class JpegStream:
                     await self.notify_clients(stop_reason="Insufficient disk space (less than 5GB)")
                     return
 
+                # Check folder size
+                if self.current_folder and self.get_folder_size(IMAGES_DIR / self.current_folder) > self.max_folder_size:
+                    logging.info(f"Folder {self.current_folder} exceeded 1GB, creating new folder")
+                    self.create_new_folder()
+                    await self.notify_clients()
+
                 jpeg_data = await self.output.read()
                 img = cv2.imdecode(np.frombuffer(jpeg_data, np.uint8), cv2.IMREAD_COLOR)
 
@@ -286,7 +301,7 @@ class JpegStream:
                 elif self.camera_type == "cameraids" and self.camera.acquiring and not self.active_preview:
                     self.camera.stop_capturing()
                     self.camera.stop_acquisition()
-
+                    
     async def stream_preview(self):
         try:
             if not self.camera or not self.camera_type:
