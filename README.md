@@ -24,7 +24,6 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
 1. **Clone the Repository**:
    ```bash
    git clone https://github.com/gnaegit/webcam-backend.git
-   cd webcam-backend
    mv webcam-backend /home/pi/webcam/webcam-backend
    cd /home/pi/webcam/webcam-backend
    ```
