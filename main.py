@@ -104,18 +104,19 @@ class JpegStream:
             return False
 
     def check_cameraids_availability(self):
-        """Check if CameraIDS is available."""
+        """Check if CameraIDS is available and devices are detected."""
         if not CAMERAIDS_AVAILABLE:
             logging.debug("CameraIDS library not available")
             return False
         try:
-            logging.debug("Attempting to initialize CameraIDS")
-            cam = CameraIDS()
-            cam.set_roi_max()
-            logging.debug("Closing CameraIDS")
-            cam.close()
-            logging.info("CameraIDS detected and functional")
-            return True
+            logging.debug("Attempting to list CameraIDS devices")
+            devices = CameraIDS.list_devices()
+            if devices:
+                logging.info(f"CameraIDS detected with {len(devices)} device(s)")
+                return True
+            else:
+                logging.debug("No CameraIDS devices found")
+                return False
         except Exception as e:
             logging.debug(f"Failed to detect CameraIDS: {str(e)}")
             return False

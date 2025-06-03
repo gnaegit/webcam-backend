@@ -49,6 +49,30 @@ class CameraIDS:
 
         s = f"{name_model} ({name_interface} ; {name_system} v.{version_system})"
         return s
+    
+    @staticmethod
+    def list_devices():
+        """
+        Return a list of dictionaries containing device information for dropdown display.
+        Each dictionary includes index, display name, model, and serial number.
+        """
+        idsp.Library.Initialize()
+        device_manager = idsp.DeviceManager.Instance()
+        device_manager.Update()
+        device_descriptors = device_manager.Devices()
+
+        devices = []
+        for i, descriptor in enumerate(device_descriptors):
+            device_info = {
+                "index": i,
+                "display_name": descriptor.DisplayName(),
+                "model": descriptor.ModelName(),
+                "serial": descriptor.SerialNumber(),
+                "label": f"{descriptor.ModelName()} ({descriptor.SerialNumber()})"
+            }
+            devices.append(device_info)
+        
+        return devices
 
     def get_attributes(self):
         attr = {}
