@@ -76,7 +76,6 @@ class JpegStream:
         self.auto_feature_managers = {}  # Per-camera auto feature manager
         self.camera_status = {"picamera": False, "cameraids": False}
         self.max_folder_size = 1_073_741_824  # 1GB
-        self.last_image_timestamps: Dict[str, float] = {}  # Track last image send time per camera
         os.makedirs("images", exist_ok=True)
 
     def get_available_disk_space(self) -> int:
@@ -257,10 +256,7 @@ class JpegStream:
         """Capture callback for CameraIDS."""
         if image is not None:
             try:
-                start_time = time.time()
                 self.cameras[camera_key]["output"].write(self._image_to_jpeg(image, camera_key))
-                encode_duration = time.time() - start_time
-                logging.info(f"Camera {camera_key}: Captured and encoded frame, duration: {encode_duration:.3f}s")
             except Exception as e:
                 logging.error(f"Error in capture callback (key: {camera_key}): {e}")
     
@@ -369,25 +365,8 @@ class JpegStream:
                     )
                     for websocket in self.connections.copy()
                 ]
-                start_time = time.time()
-                
-                # Log interval between sends
-                current_time = start_time
-                if camera_key in self.last_image_timestamps:
-                    interval = current_time - self.last_image_timestamps[camera_key]
-                    frequency = 1.0 / interval if interval > 0 else 0.0
-                    logging.info(
-                        f"Camera {camera_key}: Sending image at {datetime.datetime.now().isoformat()}, "
-                        f"interval: {interval:.3f}s, frequency: {frequency:.2f}Hz"
-                    )
-                self.last_image_timestamps[camera_key] = current_time
 
                 await asyncio.gather(*tasks, return_exceptions=True)
-                end_time = time.time()
-                logging.info(
-                    f"Camera {camera_key}: Sent image at {datetime.datetime.now().isoformat()}, "
-                    f"send duration: {(end_time - start_time):.3f}s"
-                )
                 await asyncio.sleep(0.1)
         except Exception as e:
             logging.error(f"Preview task error for {camera_key}: {e}")
