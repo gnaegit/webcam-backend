@@ -255,10 +255,13 @@ class JpegStream:
         """Capture callback for CameraIDS."""
         if image is not None:
             try:
+                start_time = time.time()
                 self.cameras[camera_key]["output"].write(self._image_to_jpeg(image, camera_key))
+                encode_duration = time.time() - start_time
+                logging.info(f"Camera {camera_key}: Captured and encoded frame, duration: {encode_duration:.3f}s")
             except Exception as e:
                 logging.error(f"Error in capture callback (key: {camera_key}): {e}")
-
+    
     def create_new_folder(self, camera_key: str):
         """Create a new folder for a specific camera."""
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -358,15 +361,17 @@ class JpegStream:
 
             while self.active_preview.get(camera_key, False) and self.connections:
                 jpeg_data = await camera_info["output"].read()
-                # Include camera_key in the data to differentiate streams
                 tasks = [
                     websocket.send_bytes(
                         b"--frame\r\nContent-Type: image/jpeg\r\nX-Camera-Key: " + camera_key.encode() + b"\r\n\r\n" + jpeg_data + b"\r\n"
                     )
                     for websocket in self.connections.copy()
                 ]
+                start_time = time.time()
                 await asyncio.gather(*tasks, return_exceptions=True)
-                await asyncio.sleep(0.1)
+                end_time = time.time()
+                logging.info(f"Camera {camera_key}: Sent image at {datetime.datetime.now().isoformat()}, duration: {(end_time - start_time):.3f}s")
+                await asyncio.sleep(0.2)  # Adjusted to 0.2s as per previous optimization
         except Exception as e:
             logging.error(f"Preview task error for {camera_key}: {e}")
             raise
@@ -374,11 +379,13 @@ class JpegStream:
             self.active_preview[camera_key] = False
             if camera_key in self.cameras:
                 camera = self.cameras[camera_key]["camera"]
-                if camera_type == "picamera" and camera.started and not self.active_storage.get(camera_key, False):
-                    camera.stop_recording()
-                elif camera_type == "cameraids" and camera.acquiring and not self.active_storage.get(camera_key, False):
-                    camera.stop_capturing()
-                    camera.stop_acquisition()
+                camera_type = self.cameras[camera_key]["type"]
+                if not self.active_storage.get(camera_key, False):
+                    if camera_type == "picamera":
+                        camera.stop_recording()
+                    elif camera_type == "cameraids":
+                        camera.stop_capturing()
+                        camera.stop_acquisition()
             await self.notify_clients()
 
     async def start_storage_task(self, camera_key: str):
@@ -594,7 +601,6 @@ async def remove_camera(request: CameraSelectionRequest):
         await jpeg_stream.notify_clients()
         raise HTTPException(status_code=500, detail=str(e))
 
-# New endpoint to list all cameras
 @app.get("/cameras")
 async def get_cameras():
     try:
@@ -602,6 +608,7 @@ async def get_cameras():
         # Add PiCam if available
         if jpeg_stream.camera_status["picamera"]:
             cameras.append({
+                "camera_key": jpeg_stream._get_camera_key("picamera", 0),  # Add camera_key
                 "type": "picamera",
                 "index": 0,
                 "display_name": "Raspberry Pi Camera",
@@ -612,7 +619,11 @@ async def get_cameras():
         # Add IDS cameras
         if jpeg_stream.camera_status["cameraids"]:
             cameras.extend([
-                {**device, "type": "cameraids"}
+                {
+                    "camera_key": jpeg_stream._get_camera_key("cameraids", device["index"]),  # Add camera_key
+                    **device,
+                    "type": "cameraids"
+                }
                 for device in jpeg_stream.check_cameraids_availability()
             ])
         return cameras
