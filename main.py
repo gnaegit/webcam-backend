@@ -15,11 +15,8 @@ import datetime
 import time
 from pydantic import BaseModel
 from pathlib import Path
-import json
 import logging
 import glob
-import shutil  # Added for disk space checking
-from typing import Dict
 
 try:
     from picamera2 import Picamera2
@@ -104,7 +101,7 @@ class JpegStream:
                 cam.configure(config)
                 logging.debug("Starting Picamera2")
                 cam.start()
-                time.sleep(0.1)  # Brief delay to ensure camera starts
+                time.sleep(0.1)
                 cam.stop()
                 logging.info("Raspberry Pi camera detected and functional")
                 return True
@@ -113,11 +110,9 @@ class JpegStream:
             return False
 
     def check_picamera_availability(self):
-        # Unchanged from original
         return PICAMERA_AVAILABLE and self._test_picamera()
 
     def check_cameraids_availability(self):
-        # Unchanged from original
         return CameraIDS.list_devices() if CAMERAIDS_AVAILABLE else []
 
     def _get_camera_key(self, camera_type: str, index: int) -> str:
@@ -131,7 +126,6 @@ class JpegStream:
         if camera_type not in ["picamera", "cameraids"]:
             raise ValueError("Invalid camera type. Use 'picamera' or 'cameraids'")
 
-        # Close existing camera for this key, if any
         if camera_key in self.cameras:
             self.close_camera(camera_key)
 
@@ -246,11 +240,15 @@ class JpegStream:
         camera_info = self.cameras[camera_key]
         if camera_info["auto_feature_manager"]:
             camera_info["auto_feature_manager"](image)
-        np_arr = image.get_numpy_3D()
-        success, jpeg_data = cv2.imencode('.jpg', np_arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not success:
-            raise RuntimeError("Failed to encode image to JPEG")
-        return jpeg_data.tobytes()
+        try:
+            np_arr = image.get_numpy_3D()
+            success, jpeg_data = cv2.imencode('.jpg', np_arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not success:
+                raise RuntimeError("Failed to encode image to JPEG")
+            return jpeg_data.tobytes()
+        except Exception as e:
+            logging.error(f"Error converting image to JPEG for {camera_key}: {e}")
+            raise
 
     def _capture_callback(self, image, camera_key: str):
         """Capture callback for CameraIDS."""
@@ -259,7 +257,7 @@ class JpegStream:
                 self.cameras[camera_key]["output"].write(self._image_to_jpeg(image, camera_key))
             except Exception as e:
                 logging.error(f"Error in capture callback (key: {camera_key}): {e}")
-    
+
     def create_new_folder(self, camera_key: str):
         """Create a new folder for a specific camera."""
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -287,6 +285,7 @@ class JpegStream:
                         camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
                 except Exception as e:
                     if "PEAK_RETURN_CODE_INVALID_HANDLE" in str(e):
+                        logging.warning(f"Invalid handle for {camera_key}, attempting reinitialization")
                         if not self.reinitialize_camera(camera_key):
                             raise RuntimeError(f"Failed to reinitialize CameraIDS (key: {camera_key})")
                         camera = self.cameras[camera_key]["camera"]
@@ -314,14 +313,15 @@ class JpegStream:
                 current_time = time.time()
                 if current_time - camera_info["last_save_time"] >= camera_info["save_interval"]:
                     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    image_path = IMAGES_DIR / folder / f"original_{timestamp}.jpg"
+                    image_path = IMAGES_DIR / folder / f"image_{timestamp}.jpg"
                     cv2.imwrite(str(image_path), img)
                     camera_info["last_save_time"] = current_time
                     await self.notify_clients(image_path=str(image_path.relative_to(IMAGES_DIR)), camera_key=camera_key)
 
                 await asyncio.sleep(0.1)
         except Exception as e:
-            logging.error(f"Storage task error for {camera_key}: {e}")
+            logging.error(f"Storage task error for {camera_key}: {str(e)}")
+            await self.notify_clients(stop_reason=f"Storage error for {camera_key}: {str(e)}")
         finally:
             if camera_key in self.cameras:
                 camera = self.cameras[camera_key]["camera"]
@@ -334,6 +334,7 @@ class JpegStream:
     async def stream_preview(self, camera_key: str):
         """Stream preview for a specific camera."""
         try:
+            logging.info(f"Starting preview stream for {camera_key}")
             if camera_key not in self.cameras:
                 raise RuntimeError(f"Camera {camera_key} not initialized")
             camera_info = self.cameras[camera_key]
@@ -344,44 +345,60 @@ class JpegStream:
                 if not camera.started:
                     camera.start_recording(MJPEGEncoder(), FileOutput(camera_info["output"]), Quality.MEDIUM)
             elif camera_type == "cameraids":
-                try:
-                    if not camera.acquiring:
-                        camera.start_acquisition()
-                    if not camera.capturing_threaded:
-                        camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
-                except Exception as e:
-                    if "PEAK_RETURN_CODE_INVALID_HANDLE" in str(e):
-                        if not self.reinitialize_camera(camera_key):
-                            raise RuntimeError(f"Failed to reinitialize CameraIDS (key: {camera_key})")
-                        camera = self.cameras[camera_key]["camera"]
-                        camera.start_acquisition()
-                        camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
+                for attempt in range(3):  # Retry up to 3 times
+                    try:
+                        if not camera.acquiring:
+                            logging.debug(f"Starting acquisition for {camera_key}, attempt {attempt + 1}")
+                            camera.start_acquisition()
+                        if not camera.capturing_threaded:
+                            logging.debug(f"Starting capturing for {camera_key}, attempt {attempt + 1}")
+                            camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
+                        break
+                    except Exception as e:
+                        if "PEAK_RETURN_CODE_INVALID_HANDLE" in str(e):
+                            logging.warning(f"Invalid handle for {camera_key}, attempt {attempt + 1}/3, reinitializing")
+                            if not self.reinitialize_camera(camera_key):
+                                logging.error(f"Failed to reinitialize CameraIDS (key: {camera_key}) after {attempt + 1} attempts")
+                                if attempt == 2:
+                                    raise RuntimeError(f"Failed to reinitialize CameraIDS (key: {camera_key})")
+                            camera = self.cameras[camera_key]["camera"]
+                            await asyncio.sleep(1)  # Delay before retry
+                        else:
+                            logging.error(f"CameraIDS error for {camera_key}: {str(e)}")
+                            raise
 
             while self.active_preview.get(camera_key, False) and self.connections:
-                jpeg_data = await camera_info["output"].read()
-                tasks = [
-                    websocket.send_bytes(
-                        b"--frame\r\nContent-Type: image/jpeg\r\nX-Camera-Key: " + camera_key.encode() + b"\r\n\r\n" + jpeg_data + b"\r\n"
-                    )
-                    for websocket in self.connections.copy()
-                ]
-
-                await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    jpeg_data = await camera_info["output"].read()
+                    tasks = [
+                        websocket.send_bytes(
+                            b"--frame\r\nContent-Type: image/jpeg\r\nX-Camera-Key: " + camera_key.encode() + b"\r\n\r\n" + jpeg_data + b"\r\n"
+                        )
+                        for websocket in self.connections.copy()
+                    ]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                except Exception as e:
+                    logging.error(f"Error sending frame for {camera_key}: {str(e)}")
+                    await asyncio.sleep(0.1)  # Brief delay to avoid tight loop
                 await asyncio.sleep(0.1)
         except Exception as e:
-            logging.error(f"Preview task error for {camera_key}: {e}")
-            raise
+            logging.error(f"Preview task error for {camera_key}: {str(e)}")
+            await self.notify_clients(stop_reason=f"Preview error for {camera_key}: {str(e)}")
         finally:
+            logging.info(f"Stopping preview stream for {camera_key}")
             self.active_preview[camera_key] = False
             if camera_key in self.cameras:
                 camera = self.cameras[camera_key]["camera"]
                 camera_type = self.cameras[camera_key]["type"]
                 if not self.active_storage.get(camera_key, False):
-                    if camera_type == "picamera":
+                    if camera_type == "picamera" and camera.started:
                         camera.stop_recording()
-                    elif camera_type == "cameraids":
-                        camera.stop_capturing()
-                        camera.stop_acquisition()
+                    elif camera_type == "cameraids" and camera.acquiring:
+                        try:
+                            camera.stop_capturing()
+                            camera.stop_acquisition()
+                        except Exception as e:
+                            logging.error(f"Error stopping CameraIDS for {camera_key}: {str(e)}")
             await self.notify_clients()
 
     async def start_storage_task(self, camera_key: str):
@@ -408,11 +425,14 @@ class JpegStream:
                 camera = self.cameras[camera_key]["camera"]
                 camera_type = self.cameras[camera_key]["type"]
                 if not self.active_preview.get(camera_key, False):
-                    if camera_type == "picamera":
+                    if camera_type == "picamera" and camera.started:
                         camera.stop()
-                    elif camera_type == "cameraids":
-                        camera.stop_capturing()
-                        camera.stop_acquisition()
+                    elif camera_type == "cameraids" and camera.acquiring:
+                        try:
+                            camera.stop_capturing()
+                            camera.stop_acquisition()
+                        except Exception as e:
+                            logging.error(f"Error stopping CameraIDS storage for {camera_key}: {str(e)}")
             await self.notify_clients()
 
     async def start_preview_task(self, camera_key: str):
@@ -439,11 +459,14 @@ class JpegStream:
                 camera = self.cameras[camera_key]["camera"]
                 camera_type = self.cameras[camera_key]["type"]
                 if not self.active_storage.get(camera_key, False):
-                    if camera_type == "picamera":
+                    if camera_type == "picamera" and camera.started:
                         camera.stop()
-                    elif camera_type == "cameraids":
-                        camera.stop_capturing()
-                        camera.stop_acquisition()
+                    elif camera_type == "cameraids" and camera.acquiring:
+                        try:
+                            camera.stop_capturing()
+                            camera.stop_acquisition()
+                        except Exception as e:
+                            logging.error(f"Error stopping CameraIDS preview for {camera_key}: {str(e)}")
             await self.notify_clients()
 
     async def notify_clients(self, image_path: str = None, stop_reason: str = None, camera_key: str = None):
@@ -524,10 +547,6 @@ async def websocket_endpoint(websocket: WebSocket):
     jpeg_stream.connections.add(websocket)
     
     try:
-        # Start preview for all initialized cameras
-        for camera_key in jpeg_stream.cameras:
-            if not jpeg_stream.active_preview.get(camera_key, False):
-                await jpeg_stream.start_preview_task(camera_key)
         while True:
             try:
                 await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
@@ -547,7 +566,6 @@ IMAGES_DIR = Path("images")
 @app.post("/select_camera")
 async def select_camera(request: CameraSelectionRequest):
     try:
-        # Parse camera_key (e.g., "cameraids_0" -> type="cameraids", index=0)
         camera_key = request.camera_key.strip()
         if "_" not in camera_key:
             raise HTTPException(status_code=400, detail=f"Invalid camera key format: {camera_key}")
@@ -563,7 +581,6 @@ async def select_camera(request: CameraSelectionRequest):
 
         logger.info(f"Parsed camera_key: {camera_key} -> type={camera_type}, index={index}")
 
-        # Validate camera availability
         if camera_type == "picamera" and not jpeg_stream.camera_status["picamera"]:
             raise HTTPException(status_code=400, detail="Raspberry Pi camera is not available")
         if camera_type == "cameraids":
@@ -571,7 +588,6 @@ async def select_camera(request: CameraSelectionRequest):
             if not any(device["index"] == index for device in available_ids_cameras):
                 raise HTTPException(status_code=400, detail=f"Invalid CameraIDS index: {index}")
 
-        # Set camera
         jpeg_stream.set_camera(camera_type, index)
         await jpeg_stream.notify_clients()
         return {"message": f"Added {camera_key}"}
@@ -601,10 +617,9 @@ async def remove_camera(request: CameraSelectionRequest):
 async def get_cameras():
     try:
         cameras = []
-        # Add PiCam if available
         if jpeg_stream.camera_status["picamera"]:
             cameras.append({
-                "camera_key": jpeg_stream._get_camera_key("picamera", 0),  # Add camera_key
+                "camera_key": jpeg_stream._get_camera_key("picamera", 0),
                 "type": "picamera",
                 "index": 0,
                 "display_name": "Raspberry Pi Camera",
@@ -612,11 +627,10 @@ async def get_cameras():
                 "serial": "N/A",
                 "label": "Raspberry Pi Camera"
             })
-        # Add IDS cameras
         if jpeg_stream.camera_status["cameraids"]:
             cameras.extend([
                 {
-                    "camera_key": jpeg_stream._get_camera_key("cameraids", device["index"]),  # Add camera_key
+                    "camera_key": jpeg_stream._get_camera_key("cameraids", device["index"]),
                     **device,
                     "type": "cameraids"
                 }
