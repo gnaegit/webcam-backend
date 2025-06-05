@@ -1,11 +1,12 @@
 import io
 import asyncio
-from zipfile import ZipFile
+from zipfile import ZipFile, ZIP_DEFLATED
 import tempfile
 import shutil
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from threading import Condition
 from contextlib import asynccontextmanager
 import numpy as np
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 from pathlib import Path
 import logging
 import glob
+import zipstream
 
 try:
     from picamera2 import Picamera2
@@ -502,6 +504,38 @@ class JpegStream:
             },
             "camera_status": self.camera_status
         }
+    
+    async def zip_folder_generator(self, folder_path: str):
+        """Generator to stream zip file creation with early browser activity."""
+        folder_full_path = IMAGES_DIR / folder_path
+        if not folder_full_path.exists() or not folder_full_path.is_dir():
+            raise HTTPException(status_code=404, detail="Folder not found")
+
+        # Step 1: Yield a valid ZIP preamble with a dummy file
+        fake_zip = io.BytesIO()
+        with ZipFile(fake_zip, 'w') as zf:
+            zf.writestr("placeholder.txt", "downloading...")  # Optional dummy content
+        fake_zip.seek(0)
+        yield fake_zip.read()  # Triggers download
+
+        # Step 2: Write actual zip file to temp
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temp_zip:
+            with ZipFile(temp_zip.name, "w") as zip_file:
+                for root, _, files in os.walk(folder_full_path):
+                    for file in files:
+                        file_path = Path(root) / file
+                        arcname = str(file_path.relative_to(IMAGES_DIR))
+                        zip_file.write(file_path, arcname)
+                        await asyncio.sleep(0)  # Yield to event loop
+
+            # Step 3: Stream actual zip file (including the dummy file again)
+            with open(temp_zip.name, "rb") as f:
+                while chunk := f.read(8192):
+                    yield chunk
+
+        # Step 4: Clean up temp file
+        os.unlink(temp_zip.name)
+
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -692,24 +726,24 @@ async def delete_file(filename: str):
 
 @app.get("/download_zip/{folder_path:path}")
 async def download_zip(folder_path: str):
-    folder_full_path = IMAGES_DIR / folder_path
-    if not folder_full_path.exists() or not folder_full_path.is_dir():
+    full_path = IMAGES_DIR / folder_path
+    if not full_path.exists() or not full_path.is_dir():
         raise HTTPException(status_code=404, detail="Folder not found")
-    
-    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    with ZipFile(temp_zip.name, "w") as zip_file:
-        for root, _, files in os.walk(folder_full_path):
-            for file in files:
-                file_path = Path(root) / file
-                arcname = str(file_path.relative_to(IMAGES_DIR))
-                zip_file.write(file_path, arcname)
-    
-    return FileResponse(
-        path=temp_zip.name,
-        filename=f"{folder_path.split('/')[-1]}.zip",
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={folder_path.split('/')[-1]}.zip"}
-    )
+
+    z = zipstream.ZipFile(mode='w', compression=zipstream.ZIP_DEFLATED)
+
+    for root, _, files in os.walk(full_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            arcname = os.path.relpath(file_path, IMAGES_DIR)
+            z.write(file_path, arcname=arcname)
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{folder_path.split("/")[-1]}.zip"',
+        "Content-Type": "application/zip",
+    }
+
+    return StreamingResponse(z, headers=headers)
 
 @app.delete("/delete_folder/{folder_path:path}")
 async def delete_folder(folder_path: str):
