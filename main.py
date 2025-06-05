@@ -120,15 +120,18 @@ class JpegStream:
         return f"{camera_type}_{index}"
 
     def set_camera(self, camera_type: str, index: int = 0):
-        """Initialize a specific camera and add it to the cameras dict."""
+        """Initialize a specific camera or return existing handle if already initialized."""
         camera_key = self._get_camera_key(camera_type, index)
         camera_type = camera_type.lower()
         if camera_type not in ["picamera", "cameraids"]:
             raise ValueError("Invalid camera type. Use 'picamera' or 'cameraids'")
 
+        # Return existing camera handle if already initialized
         if camera_key in self.cameras:
-            self.close_camera(camera_key)
+            logging.info(f"Camera {camera_key} already initialized, returning existing handle")
+            return self.cameras[camera_key]["camera"]
 
+        # Proceed with initialization if camera is not already open
         if camera_type == "picamera":
             if not self.camera_status["picamera"]:
                 raise RuntimeError("Raspberry Pi camera is not available")
@@ -149,6 +152,7 @@ class JpegStream:
                     "auto_feature_manager": None
                 }
                 logging.info(f"Initialized Picamera2 (key: {camera_key})")
+                return camera
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize Picamera2: {str(e)}")
         elif camera_type == "cameraids":
@@ -171,6 +175,7 @@ class JpegStream:
                 self.cameras[camera_key]["auto_feature_manager"].auto_exposure = 'on'
                 self.cameras[camera_key]["auto_feature_manager"].auto_gain = 'on'
                 logging.info(f"Initialized CameraIDS (key: {camera_key})")
+                return camera
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize CameraIDS: {str(e)}")
 
@@ -566,6 +571,7 @@ IMAGES_DIR = Path("images")
 @app.post("/select_camera")
 async def select_camera(request: CameraSelectionRequest):
     try:
+        # Parse camera_key (e.g., "cameraids_0" -> type="cameraids", index=0)
         camera_key = request.camera_key.strip()
         if "_" not in camera_key:
             raise HTTPException(status_code=400, detail=f"Invalid camera key format: {camera_key}")
@@ -581,6 +587,7 @@ async def select_camera(request: CameraSelectionRequest):
 
         logger.info(f"Parsed camera_key: {camera_key} -> type={camera_type}, index={index}")
 
+        # Validate camera availability
         if camera_type == "picamera" and not jpeg_stream.camera_status["picamera"]:
             raise HTTPException(status_code=400, detail="Raspberry Pi camera is not available")
         if camera_type == "cameraids":
@@ -588,13 +595,15 @@ async def select_camera(request: CameraSelectionRequest):
             if not any(device["index"] == index for device in available_ids_cameras):
                 raise HTTPException(status_code=400, detail=f"Invalid CameraIDS index: {index}")
 
-        jpeg_stream.set_camera(camera_type, index)
+        # Set or get camera
+        camera = jpeg_stream.set_camera(camera_type, index)
+        message = f"Using existing camera {camera_key}" if camera_key in jpeg_stream.cameras else f"Initialized new camera {camera_key}"
         await jpeg_stream.notify_clients()
-        return {"message": f"Added {camera_key}"}
+        return {"message": message}
     except HTTPException as e:
         raise e
     except Exception as e:
-        logger.error(f"Failed to add {request.camera_key}: {str(e)}")
+        logger.error(f"Failed to select {request.camera_key}: {str(e)}")
         await jpeg_stream.notify_clients()
         raise HTTPException(status_code=500, detail=str(e))
 
