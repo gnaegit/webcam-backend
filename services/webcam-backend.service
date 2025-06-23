@@ -7,6 +7,7 @@ User=pi
 WorkingDirectory=/home/pi/webcam/webcam-backend
 ExecStart=/home/pi/webcam/webcam-backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 Restart=always
+SuccessExitStatus=15
 Environment="PYTHONUNBUFFERED=1"
 Environment="GENICAM_GENTL64_PATH=/usr/lib/ids/cti"
 Environment="PATH=/home/pi/webcam/webcam-backend/venv/bin:/usr/local/bin:/usr/bin:/bin"

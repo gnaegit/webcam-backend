@@ -3,10 +3,11 @@ import asyncio
 from zipfile import ZipFile, ZIP_DEFLATED
 import tempfile
 import shutil
-from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi import FastAPI, WebSocket, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from threading import Condition
 from contextlib import asynccontextmanager
 import numpy as np
@@ -19,6 +20,8 @@ from pathlib import Path
 import logging
 import glob
 import zipstream
+import signal
+from starlette.websockets import WebSocketState, WebSocketDisconnect  # Add this import at the top of main.py
 
 try:
     from picamera2 import Picamera2
@@ -243,10 +246,18 @@ class JpegStream:
         await self.notify_clients()
 
     def _image_to_jpeg(self, image, camera_key: str):
-        """Convert image to JPEG for a specific camera."""
         camera_info = self.cameras[camera_key]
         if camera_info["auto_feature_manager"]:
-            camera_info["auto_feature_manager"](image)
+            for attempt in range(3):
+                try:
+                    camera_info["auto_feature_manager"](image)
+                    break
+                except Exception as e:
+                    if "PEAK_AFL_STATUS_BUSY" in str(e):
+                        logging.warning(f"PEAK_AFL_STATUS_BUSY for {camera_key}, attempt {attempt + 1}/3")
+                        time.sleep(0.1)
+                    else:
+                        raise
         try:
             np_arr = image.get_numpy_3D()
             success, jpeg_data = cv2.imencode('.jpg', np_arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
@@ -545,6 +556,13 @@ logging.basicConfig(
 logger = logging.getLogger("myapp")
 jpeg_stream = JpegStream()
 
+# Simple authentication for restart endpoint
+security = HTTPBearer()
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.credentials != "supersecretkey":  # Hardcoded for simplicity; use env vars in production
+        raise HTTPException(status_code=403, detail="Invalid authorization token")
+    return credentials
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Check camera availability
@@ -581,24 +599,38 @@ app.mount("/images", StaticFiles(directory="images"), name="images")
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    status = jpeg_stream.get_stream_status()
-    await websocket.send_json(status)
-    jpeg_stream.connections.add(websocket)
-    
+    websocket_id = id(websocket)
+    logger.debug(f"WebSocket connected: {websocket_id}")
     try:
+        status = jpeg_stream.get_stream_status()
+        await websocket.send_json(status)
+        jpeg_stream.connections.add(websocket)
         while True:
             try:
-                await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
-            except asyncio.TimeoutError:
+                message = await asyncio.wait_for(websocket.receive(), timeout=1.0)
+                if message.get("type") == "websocket.disconnect":
+                    logger.debug(f"WebSocket disconnected: {websocket_id}")
+                    break
+            except (WebSocketDisconnect, asyncio.TimeoutError):
                 continue
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+            except Exception as e:
+                logger.debug(f"WebSocket receive error: {e}")
+                break
     finally:
-        jpeg_stream.connections.remove(websocket)
+        try:
+            jpeg_stream.connections.remove(websocket)
+        except KeyError:
+            logger.debug(f"WebSocket {websocket_id} already removed")
         if not jpeg_stream.connections:
             logger.info("No more connections, stopping all previews")
-            for camera_key in jpeg_stream.cameras:
+            for camera_key in list(jpeg_stream.cameras):
                 await jpeg_stream.stop_preview_task(camera_key)
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.close(code=1000)
+                logger.debug(f"Closed WebSocket: {websocket_id}")
+            except Exception as e:
+                logger.debug(f"Error closing WebSocket: {e}")
 
 IMAGES_DIR = Path("images")
 
@@ -805,3 +837,40 @@ async def set_interval(interval: IntervalRequest):
         return {"message": f"Image save interval set to {interval.interval} seconds for {interval.camera_key}"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+async def shutdown_server():
+    logger.info("Initiating graceful shutdown...")
+    close_tasks = []
+    for ws in list(jpeg_stream.connections.copy()):
+        try:
+            close_tasks.append(ws.close(code=1000))  # Normal closure
+            logger.debug(f"Scheduled closure for WebSocket: {id(ws)}")
+        except Exception as e:
+            logger.debug(f"Skipping WebSocket closure: {e}")
+    if close_tasks:
+        try:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.debug(f"Error during WebSocket closure: {e}")
+    jpeg_stream.connections.clear()
+    logger.debug("All WebSocket connections cleared")
+    os.kill(os.getpid(), signal.SIGTERM)
+    logger.info("Shutdown signal sent")
+
+@app.post("/restart_server", dependencies=[Depends(verify_token)])
+async def restart_server():
+    try:
+        logger.info("Server restart requested")
+        for camera_key in list(jpeg_stream.cameras.keys()):
+            logger.debug(f"Stopping storage for {camera_key}")
+            await jpeg_stream.stop_storage_task(camera_key)
+            logger.debug(f"Stopping preview for {camera_key}")
+            await jpeg_stream.stop_preview_task(camera_key)
+        logger.debug("Closing cameras")
+        jpeg_stream.close()
+        logger.info("Cleanup complete, initiating shutdown")
+        asyncio.create_task(shutdown_server())
+        return {"message": "Server restart initiated"}
+    except Exception as e:
+        logger.error(f"Failed to restart server: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
