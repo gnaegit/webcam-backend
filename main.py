@@ -21,7 +21,8 @@ import logging
 import glob
 import zipstream
 import signal
-from starlette.websockets import WebSocketState, WebSocketDisconnect  # Add this import at the top of main.py
+from starlette.websockets import WebSocketState, WebSocketDisconnect
+from typing import Dict, List, cast
 
 try:
     from picamera2 import Picamera2
@@ -40,12 +41,15 @@ except ImportError:
     CAMERAIDS_AVAILABLE = False
     logging.warning("CameraIDS library not installed")
 
+# Define GlobalCameraInfo type based on global_camera_info return structure
+GlobalCameraInfo = Dict[str, str | int]
+
 class IntervalRequest(BaseModel):
     camera_key: str
     interval: float
 
 class CameraSelectionRequest(BaseModel):
-    camera_key: str  
+    camera_key: str
 
 class StreamingOutput(io.BufferedIOBase):
     def __init__(self):
@@ -76,7 +80,7 @@ class JpegStream:
         self.save_intervals = {}  # Per-camera save intervals
         self.last_save_times = {}  # Per-camera last save time
         self.auto_feature_managers = {}  # Per-camera auto feature manager
-        self.camera_status = {"picamera": False, "cameraids": False}
+        self.camera_status = {"picamera": [], "cameraids": []}  # List of available camera indices
         self.max_folder_size = 1_073_741_824  # 1GB
         os.makedirs("images", exist_ok=True)
 
@@ -92,30 +96,37 @@ class JpegStream:
             if item.is_file():
                 total_size += item.stat().st_size
         return total_size
-    
-    def _test_picamera(self) -> bool:
-        """Test if a Raspberry Pi camera is functional."""
-        try:
-            video_devices = glob.glob("/dev/video*")
-            if not video_devices:
-                logging.debug("No video devices found in /dev/video*")
-                return False
-            with Picamera2() as cam:
-                logging.debug("Attempting to configure Picamera2")
-                config = cam.create_preview_configuration(main={"size": (640, 480)})
-                cam.configure(config)
-                logging.debug("Starting Picamera2")
-                cam.start()
-                time.sleep(0.1)
-                cam.stop()
-                logging.info("Raspberry Pi camera detected and functional")
-                return True
-        except Exception as e:
-            logging.debug(f"Failed to detect Raspberry Pi camera: {str(e)}")
-            return False
 
-    def check_picamera_availability(self):
-        return PICAMERA_AVAILABLE and self._test_picamera()
+    def check_picamera_availability(self) -> List[GlobalCameraInfo]:
+        """Check availability of all Raspberry Pi cameras using global_camera_info."""
+        if not PICAMERA_AVAILABLE:
+            return []
+
+        @staticmethod
+        def global_camera_info() -> List[GlobalCameraInfo]:
+            """
+            Return Id string and Model name for all attached cameras, one dict per camera.
+            Ordered correctly by camera number. Also return the location and rotation
+            of the camera when known, as these may help distinguish which is which.
+            """
+            def describe_camera(cam, num):
+                info = {k.name: v for k, v in cam.properties.items() if k.name in ("Model", "Location", "Rotation")}
+                info["Id"] = cam.id
+                info["Num"] = num
+                info["index"] = num  # Add index for consistency with CameraIDS
+                info["display_name"] = f"Raspberry Pi Camera {num}"
+                info["serial"] = cam.id
+                info["label"] = f"PiCam {num}"
+                return cast(GlobalCameraInfo, info)
+            cameras = [describe_camera(cam, i) for i, cam in enumerate(Picamera2._cm.cms.cameras)]
+            # Sort alphabetically so they are deterministic, but send USB cams to the back.
+            return sorted(cameras, key=lambda cam: ("/usb" not in cam['Id'], cam['Id']), reverse=True)
+
+        try:
+            return global_camera_info()
+        except Exception as e:
+            logging.error(f"Failed to list Picamera2 devices: {str(e)}")
+            return []
 
     def check_cameraids_availability(self):
         return CameraIDS.list_devices() if CAMERAIDS_AVAILABLE else []
@@ -138,12 +149,10 @@ class JpegStream:
 
         # Proceed with initialization if camera is not already open
         if camera_type == "picamera":
-            if not self.camera_status["picamera"]:
-                raise RuntimeError("Raspberry Pi camera is not available")
-            if index != 0:
-                raise ValueError("PiCam only supports index 0")
+            if not any(cam["index"] == index for cam in self.camera_status["picamera"]):
+                raise RuntimeError(f"Raspberry Pi camera at index {index} is not available")
             try:
-                camera = Picamera2()
+                camera = Picamera2(index)
                 video_config = camera.create_video_configuration(main={"size": (1920, 1080)})
                 camera.configure(video_config)
                 self.cameras[camera_key] = {
@@ -159,10 +168,10 @@ class JpegStream:
                 logging.info(f"Initialized Picamera2 (key: {camera_key})")
                 return camera
             except Exception as e:
-                raise RuntimeError(f"Failed to initialize Picamera2: {str(e)}")
+                raise RuntimeError(f"Failed to initialize Picamera2 at index {index}: {str(e)}")
         elif camera_type == "cameraids":
-            if not self.camera_status["cameraids"]:
-                raise RuntimeError("CameraIDS is not available")
+            if not any(cam["index"] == index for cam in self.camera_status["cameraids"]):
+                raise RuntimeError(f"CameraIDS at index {index} is not available")
             try:
                 camera = CameraIDS(id_device=index)
                 camera.set_roi_max()
@@ -259,7 +268,10 @@ class JpegStream:
                     else:
                         raise
         try:
-            np_arr = image.get_numpy_3D()
+            if isinstance(image, np.ndarray):
+                np_arr = image
+            else:
+                np_arr = image.get_numpy_3D() if hasattr(image, 'get_numpy_3D') else np.array(image)
             success, jpeg_data = cv2.imencode('.jpg', np_arr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if not success:
                 raise RuntimeError("Failed to encode image to JPEG")
@@ -343,11 +355,13 @@ class JpegStream:
         finally:
             if camera_key in self.cameras:
                 camera = self.cameras[camera_key]["camera"]
-                if camera_type == "picamera" and camera.started and not self.active_preview.get(camera_key, False):
-                    camera.stop_recording()
-                elif camera_type == "cameraids" and camera.acquiring and not self.active_preview.get(camera_key, False):
-                    camera.stop_capturing()
-                    camera.stop_acquisition()
+                if camera_type == "picamera":
+                    if camera.started and not self.active_preview.get(camera_key, False):
+                        camera.stop_recording()
+                elif camera_type == "cameraids":
+                    if camera.acquiring and not self.active_preview.get(camera_key, False):
+                        camera.stop_capturing()
+                        camera.stop_acquisition()
 
     async def stream_preview(self, camera_key: str):
         """Stream preview for a specific camera."""
@@ -363,7 +377,7 @@ class JpegStream:
                 if not camera.started:
                     camera.start_recording(MJPEGEncoder(), FileOutput(camera_info["output"]), Quality.MEDIUM)
             elif camera_type == "cameraids":
-                for attempt in range(3):  # Retry up to 3 times
+                for attempt in range(3):
                     try:
                         if not camera.acquiring:
                             logging.debug(f"Starting acquisition for {camera_key}, attempt {attempt + 1}")
@@ -380,7 +394,7 @@ class JpegStream:
                                 if attempt == 2:
                                     raise RuntimeError(f"Failed to reinitialize CameraIDS (key: {camera_key})")
                             camera = self.cameras[camera_key]["camera"]
-                            await asyncio.sleep(1)  # Delay before retry
+                            await asyncio.sleep(1)
                         else:
                             logging.error(f"CameraIDS error for {camera_key}: {str(e)}")
                             raise
@@ -397,7 +411,7 @@ class JpegStream:
                     await asyncio.gather(*tasks, return_exceptions=True)
                 except Exception as e:
                     logging.error(f"Error sending frame for {camera_key}: {str(e)}")
-                    await asyncio.sleep(0.1)  # Brief delay to avoid tight loop
+                    await asyncio.sleep(0.1)
                 await asyncio.sleep(0.1)
         except Exception as e:
             logging.error(f"Preview task error for {camera_key}: {str(e)}")
@@ -515,21 +529,19 @@ class JpegStream:
             },
             "camera_status": self.camera_status
         }
-    
+
     async def zip_folder_generator(self, folder_path: str):
         """Generator to stream zip file creation with early browser activity."""
         folder_full_path = IMAGES_DIR / folder_path
         if not folder_full_path.exists() or not folder_full_path.is_dir():
             raise HTTPException(status_code=404, detail="Folder not found")
 
-        # Step 1: Yield a valid ZIP preamble with a dummy file
         fake_zip = io.BytesIO()
         with ZipFile(fake_zip, 'w') as zf:
-            zf.writestr("placeholder.txt", "downloading...")  # Optional dummy content
+            zf.writestr("placeholder.txt", "downloading...")
         fake_zip.seek(0)
-        yield fake_zip.read()  # Triggers download
+        yield fake_zip.read()
 
-        # Step 2: Write actual zip file to temp
         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temp_zip:
             with ZipFile(temp_zip.name, "w") as zip_file:
                 for root, _, files in os.walk(folder_full_path):
@@ -537,16 +549,13 @@ class JpegStream:
                         file_path = Path(root) / file
                         arcname = str(file_path.relative_to(IMAGES_DIR))
                         zip_file.write(file_path, arcname)
-                        await asyncio.sleep(0)  # Yield to event loop
+                        await asyncio.sleep(0)
 
-            # Step 3: Stream actual zip file (including the dummy file again)
             with open(temp_zip.name, "rb") as f:
                 while chunk := f.read(8192):
                     yield chunk
 
-        # Step 4: Clean up temp file
         os.unlink(temp_zip.name)
-
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -556,10 +565,9 @@ logging.basicConfig(
 logger = logging.getLogger("myapp")
 jpeg_stream = JpegStream()
 
-# Simple authentication for restart endpoint
 security = HTTPBearer()
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != "supersecretkey":  # Hardcoded for simplicity; use env vars in production
+    if credentials.credentials != "supersecretkey":
         raise HTTPException(status_code=403, detail="Invalid authorization token")
     return credentials
 
@@ -567,24 +575,23 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 async def lifespan(app: FastAPI):
     # Check camera availability
     jpeg_stream.camera_status["picamera"] = jpeg_stream.check_picamera_availability()
-    jpeg_stream.camera_status["cameraids"] = bool(jpeg_stream.check_cameraids_availability())
+    jpeg_stream.camera_status["cameraids"] = jpeg_stream.check_cameraids_availability()
     logger.info(f"Camera status: {jpeg_stream.camera_status}")
 
     # Initialize all available cameras
-    if jpeg_stream.camera_status["picamera"]:
+    for device in jpeg_stream.camera_status["picamera"]:
         try:
-            jpeg_stream.set_camera("picamera", index=0)
-            logger.info("Initialized Raspberry Pi camera")
+            jpeg_stream.set_camera("picamera", index=device["index"])
+            logger.info(f"Initialized Raspberry Pi camera at index {device['index']}")
         except Exception as e:
-            logger.error(f"Failed to initialize PiCam: {str(e)}")
+            logger.error(f"Failed to initialize PiCam at index {device['index']}: {str(e)}")
 
-    if jpeg_stream.camera_status["cameraids"]:
-        for device in jpeg_stream.check_cameraids_availability():
-            try:
-                jpeg_stream.set_camera("cameraids", index=device["index"])
-                logger.info(f"Initialized CameraIDS (index: {device['index']})")
-            except Exception as e:
-                logger.error(f"Failed to initialize CameraIDS (index: {device['index']}): {str(e)}")
+    for device in jpeg_stream.camera_status["cameraids"]:
+        try:
+            jpeg_stream.set_camera("cameraids", index=device["index"])
+            logger.info(f"Initialized CameraIDS (index: {device['index']})")
+        except Exception as e:
+            logger.error(f"Failed to initialize CameraIDS (index: {device['index']}): {str(e)}")
 
     yield
     logger.info("Shutting down, cleaning up resources")
@@ -637,7 +644,6 @@ IMAGES_DIR = Path("images")
 @app.post("/select_camera")
 async def select_camera(request: CameraSelectionRequest):
     try:
-        # Parse camera_key (e.g., "cameraids_0" -> type="cameraids", index=0)
         camera_key = request.camera_key.strip()
         if "_" not in camera_key:
             raise HTTPException(status_code=400, detail=f"Invalid camera key format: {camera_key}")
@@ -653,15 +659,13 @@ async def select_camera(request: CameraSelectionRequest):
 
         logger.info(f"Parsed camera_key: {camera_key} -> type={camera_type}, index={index}")
 
-        # Validate camera availability
-        if camera_type == "picamera" and not jpeg_stream.camera_status["picamera"]:
-            raise HTTPException(status_code=400, detail="Raspberry Pi camera is not available")
-        if camera_type == "cameraids":
-            available_ids_cameras = jpeg_stream.check_cameraids_availability()
-            if not any(device["index"] == index for device in available_ids_cameras):
-                raise HTTPException(status_code=400, detail=f"Invalid CameraIDS index: {index}")
+        if camera_type == "picamera":
+            if not any(cam["index"] == index for cam in jpeg_stream.camera_status["picamera"]):
+                raise HTTPException(status_code=400, detail=f"Raspberry Pi camera at index {index} is not available")
+        elif camera_type == "cameraids":
+            if not any(cam["index"] == index for cam in jpeg_stream.camera_status["cameraids"]):
+                raise HTTPException(status_code=400, detail=f"CameraIDS at index {index} is not available")
 
-        # Set or get camera
         camera = jpeg_stream.set_camera(camera_type, index)
         message = f"Using existing camera {camera_key}" if camera_key in jpeg_stream.cameras else f"Initialized new camera {camera_key}"
         await jpeg_stream.notify_clients()
@@ -692,25 +696,24 @@ async def remove_camera(request: CameraSelectionRequest):
 async def get_cameras():
     try:
         cameras = []
-        if jpeg_stream.camera_status["picamera"]:
+        for device in jpeg_stream.camera_status["picamera"]:
             cameras.append({
-                "camera_key": jpeg_stream._get_camera_key("picamera", 0),
+                "camera_key": jpeg_stream._get_camera_key("picamera", device["index"]),
                 "type": "picamera",
-                "index": 0,
-                "display_name": "Raspberry Pi Camera",
-                "model": "PiCam",
-                "serial": "N/A",
-                "label": "Raspberry Pi Camera"
+                "index": device["index"],
+                "display_name": device.get("display_name", f"Raspberry Pi Camera {device['index']}"),
+                "model": device.get("Model", "PiCam"),
+                "serial": device.get("Id", f"picam_{device['index']}"),
+                "label": device.get("label", f"PiCam {device['index']}"),
+                "location": device.get("Location"),
+                "rotation": device.get("Rotation")
             })
-        if jpeg_stream.camera_status["cameraids"]:
-            cameras.extend([
-                {
-                    "camera_key": jpeg_stream._get_camera_key("cameraids", device["index"]),
-                    **device,
-                    "type": "cameraids"
-                }
-                for device in jpeg_stream.check_cameraids_availability()
-            ])
+        for device in jpeg_stream.camera_status["cameraids"]:
+            cameras.append({
+                "camera_key": jpeg_stream._get_camera_key("cameraids", device["index"]),
+                **device,
+                "type": "cameraids"
+            })
         return cameras
     except Exception as e:
         logger.error(f"Error listing cameras: {str(e)}")
@@ -843,7 +846,7 @@ async def shutdown_server():
     close_tasks = []
     for ws in list(jpeg_stream.connections.copy()):
         try:
-            close_tasks.append(ws.close(code=1000))  # Normal closure
+            close_tasks.append(ws.close(code=1000))
             logger.debug(f"Scheduled closure for WebSocket: {id(ws)}")
         except Exception as e:
             logger.debug(f"Skipping WebSocket closure: {e}")
