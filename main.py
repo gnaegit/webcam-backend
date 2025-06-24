@@ -1,6 +1,6 @@
 import io
 import asyncio
-from zipfile import ZipFile, ZIP_DEFLATED
+from zipfile import ZipFile
 import tempfile
 import shutil
 from fastapi import FastAPI, WebSocket, HTTPException, Depends
@@ -18,7 +18,6 @@ import time
 from pydantic import BaseModel
 from pathlib import Path
 import logging
-import glob
 import zipstream
 import signal
 from starlette.websockets import WebSocketState, WebSocketDisconnect
@@ -40,6 +39,8 @@ try:
 except ImportError:
     CAMERAIDS_AVAILABLE = False
     logging.warning("CameraIDS library not installed")
+
+IMAGES_DIR = Path("images")
 
 # Define GlobalCameraInfo type based on global_camera_info return structure
 GlobalCameraInfo = Dict[str, str | int]
@@ -82,7 +83,8 @@ class JpegStream:
         self.auto_feature_managers = {}  # Per-camera auto feature manager
         self.camera_status = {"picamera": [], "cameraids": []}  # List of available camera indices
         self.max_folder_size = 1_073_741_824  # 1GB
-        os.makedirs("images", exist_ok=True)
+        os.makedirs(IMAGES_DIR, exist_ok=True)
+        os.makedirs(IMAGES_DIR / "trigger", exist_ok=True)
 
     def get_available_disk_space(self) -> int:
         """Check available disk space in bytes."""
@@ -253,6 +255,53 @@ class JpegStream:
             raise ValueError("Interval must be greater than zero.")
         self.cameras[camera_key]["save_interval"] = interval
         await self.notify_clients()
+
+    async def capture_single_image(self, camera_key: str) -> str:
+        """Capture a single image and save it to the trigger folder."""
+        if camera_key not in self.cameras:
+            raise HTTPException(status_code=404, detail=f"Camera {camera_key} not found")
+
+        camera_info = self.cameras[camera_key]
+        camera = camera_info["camera"]
+        camera_type = camera_info["type"]
+
+        try:
+            # Start camera if not already running
+            if camera_type == "picamera":
+                if not camera.started:
+                    camera.start_recording(MJPEGEncoder(), FileOutput(camera_info["output"]), Quality.MEDIUM)
+            elif camera_type == "cameraids":
+                if not camera.acquiring:
+                    camera.start_acquisition()
+                if not camera.capturing_threaded:
+                    camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
+
+            # Capture one frame
+            jpeg_data = await camera_info["output"].read()
+            img = cv2.imdecode(np.frombuffer(jpeg_data, np.uint8), cv2.IMREAD_COLOR)
+
+            # Stop camera if it wasn't running before
+            if camera_type == "picamera" and not self.active_preview.get(camera_key, False) and not self.active_storage.get(camera_key, False):
+                camera.stop_recording()
+            elif camera_type == "cameraids" and not self.active_preview.get(camera_key, False) and not self.active_storage.get(camera_key, False):
+                try:
+                    camera.stop_capturing()
+                    camera.stop_acquisition()
+                except Exception as e:
+                    logging.error(f"Error stopping CameraIDS after single capture for {camera_key}: {str(e)}")
+
+            # Save the image to the trigger folder
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            image_path = IMAGES_DIR / "trigger" / f"{camera_key}_image_{timestamp}.jpg"
+            cv2.imwrite(str(image_path), img)
+
+            # Notify clients
+            await self.notify_clients(image_path=str(image_path.relative_to(IMAGES_DIR)), camera_key=camera_key)
+            return str(image_path.relative_to(IMAGES_DIR))
+        
+        except Exception as e:
+            logging.error(f"Error capturing single image for {camera_key}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to capture image: {str(e)}")
 
     def _image_to_jpeg(self, image, camera_key: str):
         camera_info = self.cameras[camera_key]
@@ -639,8 +688,6 @@ async def websocket_endpoint(websocket: WebSocket):
             except Exception as e:
                 logger.debug(f"Error closing WebSocket: {e}")
 
-IMAGES_DIR = Path("images")
-
 @app.post("/select_camera")
 async def select_camera(request: CameraSelectionRequest):
     try:
@@ -859,6 +906,17 @@ async def shutdown_server():
     logger.debug("All WebSocket connections cleared")
     os.kill(os.getpid(), signal.SIGTERM)
     logger.info("Shutdown signal sent")
+
+@app.post("/capture_image")
+async def capture_image(request: CameraSelectionRequest):
+    try:
+        image_path = await jpeg_stream.capture_single_image(request.camera_key)
+        return {"message": f"Image captured and saved to {image_path} for {request.camera_key}"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to capture image for {request.camera_key}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/restart_server", dependencies=[Depends(verify_token)])
 async def restart_server():
