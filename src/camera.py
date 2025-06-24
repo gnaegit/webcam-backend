@@ -18,6 +18,10 @@ from src.utils import *
 
 TARGET_PIXELFORMAT = idsp_ipl.PixelFormatName_RGB8
 
+class CameraConfigurationError(Exception):
+    """Exception raised for camera configuration errors."""
+    pass
+
 class CameraIDS:
     def __init__(self, id_device=0, pixel_format=TARGET_PIXELFORMAT):
         self.acquiring = None
@@ -327,6 +331,74 @@ class CameraIDS:
         while not self.killed:
             image = self.capture()
             on_capture_callback(image)
+
+    def set_binning(self, horizontal_bin_factor, vertical_bin_factor, mode="Sum"):
+        """
+        Set binning for the camera.
+        
+        Args:
+            horizontal_bin_factor (int): Horizontal binning factor (e.g., 2 for 2x binning).
+            vertical_bin_factor (int): Vertical binning factor (e.g., 2 for 2x binning).
+            mode (str): Binning mode, either "Sum" or "Average" (if supported).
+        
+        Returns:
+            bool: True if binning was set successfully, False otherwise.
+        
+        Raises:
+            CameraConfigurationError: If binning cannot be set due to invalid parameters or hardware limitations.
+        """
+        if self.acquiring:
+            print("Warning: Cannot set binning while acquisition is active.")
+            return False
+
+        try:
+            if self.has_attribute("BinningSelector"):
+                self.set_entry("BinningSelector", "Sensor")
+            else:
+                raise CameraConfigurationError("BinningSelector not available.")
+
+            if self.has_attribute("BinningHorizontal"):
+                h_min = self.get_min("BinningHorizontal")
+                h_max = self.get_max("BinningHorizontal")
+                if h_min <= horizontal_bin_factor <= h_max:
+                    self.set_value("BinningHorizontal", horizontal_bin_factor)
+                    print(f"Horizontal binning set to {horizontal_bin_factor}x")
+                else:
+                    raise CameraConfigurationError(f"Horizontal binning factor {horizontal_bin_factor} out of range [{h_min}, {h_max}]")
+            else:
+                raise CameraConfigurationError("Horizontal binning not supported.")
+
+            if self.has_attribute("BinningVertical"):
+                v_min = self.get_min("BinningVertical")
+                v_max = self.get_max("BinningVertical")
+                if v_min <= vertical_bin_factor <= v_max:
+                    self.set_value("BinningVertical", vertical_bin_factor)
+                    print(f"Vertical binning set to {vertical_bin_factor}x")
+                else:
+                    raise CameraConfigurationError(f"Vertical binning factor {vertical_bin_factor} out of range [{v_min}, {v_max}]")
+            else:
+                raise CameraConfigurationError("Vertical binning not supported.")
+
+            # if self.has_attribute("BinningHorizontalMode"):
+            #     self.set_entry("BinningHorizontalMode", mode)
+            #     print(f"Horizontal binning mode set to {mode}")
+            # if self.has_attribute("BinningVerticalMode"):
+            #     self.set_entry("BinningVerticalMode", mode)
+            #     print(f"Vertical binning mode set to {mode}")
+
+            self._revoke_buffers()
+            self._setup_buffers()
+            self._preallocate_conversion()
+
+            return True
+
+        except CameraConfigurationError as e:
+            print(f"Configuration error: {e}")
+            return False
+        except Exception as e:
+            print(f"Unexpected error setting binning: {e}")
+            return False
+
     @property
     def status(self):
         self.nodemap.FindNode("DeviceSelector").SetValue(0)
