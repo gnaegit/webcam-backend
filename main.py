@@ -21,7 +21,8 @@ import logging
 import glob
 import zipstream
 import signal
-from starlette.websockets import WebSocketState, WebSocketDisconnect  # Add this import at the top of main.py
+from starlette.websockets import WebSocketState, WebSocketDisconnect
+import ids_peak_ipl as idsp_ipl
 
 try:
     from picamera2 import Picamera2
@@ -33,7 +34,7 @@ except ImportError:
     logging.warning("Picamera2 library not installed")
 
 try:
-    from src.camera import CameraIDS
+    from src.camera import CameraIDS, CameraConfigurationError
     from src.auto_feature_manager import AutoFeatureManager
     CAMERAIDS_AVAILABLE = True
 except ImportError:
@@ -45,7 +46,13 @@ class IntervalRequest(BaseModel):
     interval: float
 
 class CameraSelectionRequest(BaseModel):
-    camera_key: str  
+    camera_key: str
+
+class BinningRequest(BaseModel):
+    camera_key: str
+    horizontal_bin_factor: int
+    vertical_bin_factor: int
+    mode: str = "Sum"
 
 class StreamingOutput(io.BufferedIOBase):
     def __init__(self):
@@ -65,28 +72,26 @@ class StreamingOutput(io.BufferedIOBase):
 
 class JpegStream:
     def __init__(self):
-        self.cameras = {}  # Dict to store camera instances: {camera_key: {"camera": ..., "type": ..., "index": ..., ...}}
-        self.active_preview = {}  # Per-camera preview status
-        self.active_storage = {}  # Per-camera storage status
-        self.connections = set()  # WebSocket connections
-        self.preview_tasks = {}  # Per-camera preview tasks
-        self.storage_tasks = {}  # Per-camera storage tasks
-        self.current_folders = {}  # Per-camera storage folders
-        self.outputs = {}  # Per-camera StreamingOutput
-        self.save_intervals = {}  # Per-camera save intervals
-        self.last_save_times = {}  # Per-camera last save time
-        self.auto_feature_managers = {}  # Per-camera auto feature manager
+        self.cameras = {}
+        self.active_preview = {}
+        self.active_storage = {}
+        self.connections = set()
+        self.preview_tasks = {}
+        self.storage_tasks = {}
+        self.current_folders = {}
+        self.outputs = {}
+        self.save_intervals = {}
+        self.last_save_times = {}
+        self.auto_feature_managers = {}
         self.camera_status = {"picamera": False, "cameraids": False}
         self.max_folder_size = 1_073_741_824  # 1GB
         os.makedirs("images", exist_ok=True)
 
     def get_available_disk_space(self) -> int:
-        """Check available disk space in bytes."""
         stat = shutil.disk_usage(IMAGES_DIR)
         return stat.free
 
     def get_folder_size(self, folder_path: Path) -> int:
-        """Calculate the total size of a folder in bytes."""
         total_size = 0
         for item in folder_path.rglob("*"):
             if item.is_file():
@@ -94,7 +99,6 @@ class JpegStream:
         return total_size
     
     def _test_picamera(self) -> bool:
-        """Test if a Raspberry Pi camera is functional."""
         try:
             video_devices = glob.glob("/dev/video*")
             if not video_devices:
@@ -121,22 +125,18 @@ class JpegStream:
         return CameraIDS.list_devices() if CAMERAIDS_AVAILABLE else []
 
     def _get_camera_key(self, camera_type: str, index: int) -> str:
-        """Generate a unique key for a camera."""
         return f"{camera_type}_{index}"
 
     def set_camera(self, camera_type: str, index: int = 0):
-        """Initialize a specific camera or return existing handle if already initialized."""
         camera_key = self._get_camera_key(camera_type, index)
         camera_type = camera_type.lower()
         if camera_type not in ["picamera", "cameraids"]:
             raise ValueError("Invalid camera type. Use 'picamera' or 'cameraids'")
 
-        # Return existing camera handle if already initialized
         if camera_key in self.cameras:
             logging.info(f"Camera {camera_key} already initialized, returning existing handle")
             return self.cameras[camera_key]["camera"]
 
-        # Proceed with initialization if camera is not already open
         if camera_type == "picamera":
             if not self.camera_status["picamera"]:
                 raise RuntimeError("Raspberry Pi camera is not available")
@@ -154,7 +154,8 @@ class JpegStream:
                     "folder": None,
                     "last_save_time": 0,
                     "save_interval": 5,
-                    "auto_feature_manager": None
+                    "auto_feature_manager": None,
+                    "binning": {"horizontal": 1, "vertical": 1, "mode": "Sum"}
                 }
                 logging.info(f"Initialized Picamera2 (key: {camera_key})")
                 return camera
@@ -174,7 +175,8 @@ class JpegStream:
                     "folder": None,
                     "last_save_time": 0,
                     "save_interval": 5,
-                    "auto_feature_manager": AutoFeatureManager(camera)
+                    "auto_feature_manager": AutoFeatureManager(camera),
+                    "binning": {"horizontal": 1, "vertical": 1, "mode": "Sum"}
                 }
                 self.cameras[camera_key]["auto_feature_manager"].auto_white_balance = 'on'
                 self.cameras[camera_key]["auto_feature_manager"].auto_exposure = 'on'
@@ -185,7 +187,6 @@ class JpegStream:
                 raise RuntimeError(f"Failed to initialize CameraIDS: {str(e)}")
 
     def close_camera(self, camera_key: str):
-        """Close a specific camera and clean up its resources."""
         if camera_key not in self.cameras:
             return
         camera_info = self.cameras[camera_key]
@@ -217,18 +218,24 @@ class JpegStream:
             self.auto_feature_managers.pop(camera_key, None)
 
     def close(self):
-        """Close all cameras."""
         for camera_key in list(self.cameras.keys()):
             self.close_camera(camera_key)
 
     def reinitialize_camera(self, camera_key: str):
-        """Reinitialize a specific camera."""
         if camera_key not in self.cameras:
             return False
         camera_info = self.cameras[camera_key]
         try:
             self.close_camera(camera_key)
-            self.set_camera(camera_info["type"], camera_info["index"])
+            new_camera = self.set_camera(camera_info["type"], camera_info["index"])
+            if camera_info["type"] == "cameraids":
+                binning = camera_info["binning"]
+                self.set_binning(
+                    camera_key,
+                    binning["horizontal"],
+                    binning["vertical"],
+                    binning["mode"]
+                )
             logging.info(f"Reinitialized camera (key: {camera_key})")
             return True
         except Exception as e:
@@ -237,13 +244,61 @@ class JpegStream:
             return False
 
     async def set_interval(self, camera_key: str, interval: float):
-        """Set save interval for a specific camera."""
         if camera_key not in self.cameras:
             raise ValueError(f"Camera {camera_key} not found")
         if interval <= 0:
             raise ValueError("Interval must be greater than zero.")
         self.cameras[camera_key]["save_interval"] = interval
         await self.notify_clients()
+
+    async def set_binning(self, camera_key: str, horizontal_bin_factor: int, vertical_bin_factor: int, mode: str = "Sum"):
+        if camera_key not in self.cameras:
+            raise ValueError(f"Camera {camera_key} not found")
+        camera_info = self.cameras[camera_key]
+        if camera_info["type"] != "cameraids":
+            raise ValueError(f"Binning is only supported for CameraIDS, not {camera_info['type']}")
+
+        camera = camera_info["camera"]
+        was_acquiring = camera.acquiring
+        was_capturing = camera.capturing_threaded
+
+        try:
+            if was_capturing:
+                camera.stop_capturing()
+            if was_acquiring:
+                camera.stop_acquisition()
+
+            if not camera.set_binning(horizontal_bin_factor, vertical_bin_factor, mode):
+                raise CameraConfigurationError("Failed to set binning")
+
+            camera_info["binning"] = {
+                "horizontal": horizontal_bin_factor,
+                "vertical": vertical_bin_factor,
+                "mode": mode
+            }
+
+            if was_acquiring:
+                camera.start_acquisition()
+            if was_capturing:
+                camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
+
+            logging.info(f"Set binning for {camera_key}: {horizontal_bin_factor}x{vertical_bin_factor}, mode={mode}")
+            await self.notify_clients()
+
+        except CameraConfigurationError as e:
+            logging.error(f"Failed to set binning for {camera_key}: {str(e)}")
+            raise
+        except Exception as e:
+            logging.error(f"Unexpected error setting binning for {camera_key}: {str(e)}")
+            raise CameraConfigurationError(f"Unexpected error: {str(e)}")
+        finally:
+            if was_acquiring and not camera.acquiring:
+                try:
+                    camera.start_acquisition()
+                    if was_capturing:
+                        camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
+                except Exception as e:
+                    logging.error(f"Failed to restore camera state for {camera_key}: {str(e)}")
 
     def _image_to_jpeg(self, image, camera_key: str):
         camera_info = self.cameras[camera_key]
@@ -269,7 +324,6 @@ class JpegStream:
             raise
 
     def _capture_callback(self, image, camera_key: str):
-        """Capture callback for CameraIDS."""
         if image is not None:
             try:
                 self.cameras[camera_key]["output"].write(self._image_to_jpeg(image, camera_key))
@@ -277,14 +331,12 @@ class JpegStream:
                 logging.error(f"Error in capture callback (key: {camera_key}): {e}")
 
     def create_new_folder(self, camera_key: str):
-        """Create a new folder for a specific camera."""
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         folder = Path(f"{camera_key}_{timestamp}")
         os.makedirs(IMAGES_DIR / folder, exist_ok=True)
         self.cameras[camera_key]["folder"] = folder
 
     async def store_images(self, camera_key: str):
-        """Store images for a specific camera."""
         try:
             if camera_key not in self.cameras:
                 raise RuntimeError(f"Camera {camera_key} not initialized")
@@ -300,7 +352,7 @@ class JpegStream:
                     if not camera.acquiring:
                         camera.start_acquisition()
                     if not camera.capturing_threaded:
-                        camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
+                        camera.start_capturing(on_capture=lambda img: self._capture_callback(img, camera_key))
                 except Exception as e:
                     if "PEAK_RETURN_CODE_INVALID_HANDLE" in str(e):
                         logging.warning(f"Invalid handle for {camera_key}, attempting reinitialization")
@@ -308,7 +360,7 @@ class JpegStream:
                             raise RuntimeError(f"Failed to reinitialize CameraIDS (key: {camera_key})")
                         camera = self.cameras[camera_key]["camera"]
                         camera.start_acquisition()
-                        camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
+                        camera.start_capturing(on_capture=lambda img: self._capture_callback(img, camera_key))
 
             self.create_new_folder(camera_key)
 
@@ -350,7 +402,6 @@ class JpegStream:
                     camera.stop_acquisition()
 
     async def stream_preview(self, camera_key: str):
-        """Stream preview for a specific camera."""
         try:
             logging.info(f"Starting preview stream for {camera_key}")
             if camera_key not in self.cameras:
@@ -363,14 +414,14 @@ class JpegStream:
                 if not camera.started:
                     camera.start_recording(MJPEGEncoder(), FileOutput(camera_info["output"]), Quality.MEDIUM)
             elif camera_type == "cameraids":
-                for attempt in range(3):  # Retry up to 3 times
+                for attempt in range(3):
                     try:
                         if not camera.acquiring:
                             logging.debug(f"Starting acquisition for {camera_key}, attempt {attempt + 1}")
                             camera.start_acquisition()
                         if not camera.capturing_threaded:
                             logging.debug(f"Starting capturing for {camera_key}, attempt {attempt + 1}")
-                            camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
+                            camera.start_capturing(on_capture=lambda img: self._capture_callback(img, camera_key))
                         break
                     except Exception as e:
                         if "PEAK_RETURN_CODE_INVALID_HANDLE" in str(e):
@@ -380,7 +431,7 @@ class JpegStream:
                                 if attempt == 2:
                                     raise RuntimeError(f"Failed to reinitialize CameraIDS (key: {camera_key})")
                             camera = self.cameras[camera_key]["camera"]
-                            await asyncio.sleep(1)  # Delay before retry
+                            await asyncio.sleep(1)
                         else:
                             logging.error(f"CameraIDS error for {camera_key}: {str(e)}")
                             raise
@@ -397,7 +448,7 @@ class JpegStream:
                     await asyncio.gather(*tasks, return_exceptions=True)
                 except Exception as e:
                     logging.error(f"Error sending frame for {camera_key}: {str(e)}")
-                    await asyncio.sleep(0.1)  # Brief delay to avoid tight loop
+                    await asyncio.sleep(0.1)
                 await asyncio.sleep(0.1)
         except Exception as e:
             logging.error(f"Preview task error for {camera_key}: {str(e)}")
@@ -416,11 +467,10 @@ class JpegStream:
                             camera.stop_capturing()
                             camera.stop_acquisition()
                         except Exception as e:
-                            logging.error(f"Error stopping CameraIDS for {camera_key}: {str(e)}")
+                            logging.error(f"Error stopping CameraIDS for {camera_key}: {e}")
             await self.notify_clients()
 
     async def start_storage_task(self, camera_key: str):
-        """Start storage task for a specific camera."""
         if camera_key not in self.cameras:
             raise HTTPException(status_code=500, detail=f"Camera {camera_key} not initialized")
         if not self.active_storage.get(camera_key, False):
@@ -429,7 +479,6 @@ class JpegStream:
             await self.notify_clients()
 
     async def stop_storage_task(self, camera_key: str):
-        """Stop storage task for a specific camera."""
         if camera_key in self.active_storage and self.active_storage[camera_key]:
             self.active_storage[camera_key] = False
             if camera_key in self.storage_tasks:
@@ -454,7 +503,6 @@ class JpegStream:
             await self.notify_clients()
 
     async def start_preview_task(self, camera_key: str):
-        """Start preview task for a specific camera."""
         if camera_key not in self.cameras:
             raise HTTPException(status_code=500, detail=f"Camera {camera_key} not initialized")
         if not self.active_preview.get(camera_key, False) and self.connections:
@@ -463,7 +511,6 @@ class JpegStream:
             await self.notify_clients()
 
     async def stop_preview_task(self, camera_key: str):
-        """Stop preview task for a specific camera."""
         if camera_key in self.active_preview and self.active_preview[camera_key]:
             self.active_preview[camera_key] = False
             if camera_key in self.preview_tasks:
@@ -488,7 +535,6 @@ class JpegStream:
             await self.notify_clients()
 
     async def notify_clients(self, image_path: str = None, stop_reason: str = None, camera_key: str = None):
-        """Notify clients of status updates, optionally for a specific camera."""
         status = self.get_stream_status()
         if image_path:
             status["new_image"] = image_path
@@ -500,7 +546,6 @@ class JpegStream:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def get_stream_status(self):
-        """Return status for all cameras."""
         return {
             "cameras": {
                 camera_key: {
@@ -509,7 +554,8 @@ class JpegStream:
                     "save_interval": self.cameras[camera_key]["save_interval"],
                     "current_folder": str(self.cameras[camera_key]["folder"]) if self.cameras[camera_key]["folder"] else None,
                     "camera_type": self.cameras[camera_key]["type"],
-                    "camera_index": self.cameras[camera_key]["index"]
+                    "camera_index": self.cameras[camera_key]["index"],
+                    "binning": self.cameras[camera_key]["binning"]
                 }
                 for camera_key in self.cameras
             },
@@ -517,19 +563,16 @@ class JpegStream:
         }
     
     async def zip_folder_generator(self, folder_path: str):
-        """Generator to stream zip file creation with early browser activity."""
         folder_full_path = IMAGES_DIR / folder_path
         if not folder_full_path.exists() or not folder_full_path.is_dir():
             raise HTTPException(status_code=404, detail="Folder not found")
 
-        # Step 1: Yield a valid ZIP preamble with a dummy file
         fake_zip = io.BytesIO()
         with ZipFile(fake_zip, 'w') as zf:
-            zf.writestr("placeholder.txt", "downloading...")  # Optional dummy content
+            zf.writestr("placeholder.txt", "downloading...")
         fake_zip.seek(0)
-        yield fake_zip.read()  # Triggers download
+        yield fake_zip.read()
 
-        # Step 2: Write actual zip file to temp
         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temp_zip:
             with ZipFile(temp_zip.name, "w") as zip_file:
                 for root, _, files in os.walk(folder_full_path):
@@ -537,16 +580,13 @@ class JpegStream:
                         file_path = Path(root) / file
                         arcname = str(file_path.relative_to(IMAGES_DIR))
                         zip_file.write(file_path, arcname)
-                        await asyncio.sleep(0)  # Yield to event loop
+                        await asyncio.sleep(0)
 
-            # Step 3: Stream actual zip file (including the dummy file again)
             with open(temp_zip.name, "rb") as f:
                 while chunk := f.read(8192):
                     yield chunk
 
-        # Step 4: Clean up temp file
         os.unlink(temp_zip.name)
-
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -556,21 +596,18 @@ logging.basicConfig(
 logger = logging.getLogger("myapp")
 jpeg_stream = JpegStream()
 
-# Simple authentication for restart endpoint
 security = HTTPBearer()
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != "supersecretkey":  # Hardcoded for simplicity; use env vars in production
+    if credentials.credentials != "supersecretkey":
         raise HTTPException(status_code=403, detail="Invalid authorization token")
     return credentials
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Check camera availability
     jpeg_stream.camera_status["picamera"] = jpeg_stream.check_picamera_availability()
     jpeg_stream.camera_status["cameraids"] = bool(jpeg_stream.check_cameraids_availability())
     logger.info(f"Camera status: {jpeg_stream.camera_status}")
 
-    # Initialize all available cameras
     if jpeg_stream.camera_status["picamera"]:
         try:
             jpeg_stream.set_camera("picamera", index=0)
@@ -609,12 +646,11 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 message = await asyncio.wait_for(websocket.receive(), timeout=1.0)
                 if message.get("type") == "websocket.disconnect":
-                    logger.debug(f"WebSocket disconnected: {websocket_id}")
                     break
             except (WebSocketDisconnect, asyncio.TimeoutError):
                 continue
             except Exception as e:
-                logger.debug(f"WebSocket receive error: {e}")
+                logger.debug(f"WebSocket error: {e}")
                 break
     finally:
         try:
@@ -623,7 +659,7 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.debug(f"WebSocket {websocket_id} already removed")
         if not jpeg_stream.connections:
             logger.info("No more connections, stopping all previews")
-            for camera_key in list(jpeg_stream.cameras):
+            for camera_key in list(jpeg_stream.cameras.keys()):
                 await jpeg_stream.stop_preview_task(camera_key)
         if websocket.client_state == WebSocketState.CONNECTED:
             try:
@@ -637,23 +673,21 @@ IMAGES_DIR = Path("images")
 @app.post("/select_camera")
 async def select_camera(request: CameraSelectionRequest):
     try:
-        # Parse camera_key (e.g., "cameraids_0" -> type="cameraids", index=0)
         camera_key = request.camera_key.strip()
         if "_" not in camera_key:
-            raise HTTPException(status_code=400, detail=f"Invalid camera key format: {camera_key}")
+            raise ValueError(f"Invalid camera key format: {camera_key}")
         
         camera_type, index_str = camera_key.split("_", 1)
         if camera_type not in ["picamera", "cameraids"]:
-            raise HTTPException(status_code=400, detail=f"Invalid camera type: {camera_type}")
+            raise ValueError(f"Invalid camera type: {camera_type}")
         
         try:
             index = int(index_str)
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid index format: {index_str}")
+            raise ValueError(f"Invalid index format: {index_str}")
 
         logger.info(f"Parsed camera_key: {camera_key} -> type={camera_type}, index={index}")
 
-        # Validate camera availability
         if camera_type == "picamera" and not jpeg_stream.camera_status["picamera"]:
             raise HTTPException(status_code=400, detail="Raspberry Pi camera is not available")
         if camera_type == "cameraids":
@@ -661,13 +695,14 @@ async def select_camera(request: CameraSelectionRequest):
             if not any(device["index"] == index for device in available_ids_cameras):
                 raise HTTPException(status_code=400, detail=f"Invalid CameraIDS index: {index}")
 
-        # Set or get camera
         camera = jpeg_stream.set_camera(camera_type, index)
         message = f"Using existing camera {camera_key}" if camera_key in jpeg_stream.cameras else f"Initialized new camera {camera_key}"
         await jpeg_stream.notify_clients()
         return {"message": message}
-    except HTTPException as e:
-        raise e
+    except ValueError as e:
+        logger.error(f"Failed to select {request.camera_key}: {str(e)}")
+        await jpeg_stream.notify_clients()
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to select {request.camera_key}: {str(e)}")
         await jpeg_stream.notify_clients()
@@ -805,7 +840,7 @@ async def start_storage(request: CameraSelectionRequest):
 async def stop_storage(request: CameraSelectionRequest):
     try:
         await jpeg_stream.stop_storage_task(request.camera_key)
-        return {"message": f"Image storage task stopped for {request.camera_key}"}
+        return {"message": f"Image storage stopped for {request.camera_key}"}
     except Exception as e:
         logger.error(f"Failed to stop storage for {request.camera_key}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -830,23 +865,43 @@ async def stop_preview(request: CameraSelectionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/set_interval")
-async def set_interval(interval: IntervalRequest):
+async def set_interval(request: IntervalRequest):
     try:
-        await jpeg_stream.set_interval(interval.camera_key, interval.interval)
+        await jpeg_stream.set_interval(request.camera_key, request.interval)
         await jpeg_stream.notify_clients()
-        return {"message": f"Image save interval set to {interval.interval} seconds for {interval.camera_key}"}
+        return {"message": f"Image save interval set to {request.interval} seconds for {request.camera_key}"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/set_binning")
+async def set_binning(request: BinningRequest):
+    try:
+        await jpeg_stream.set_binning(
+            request.camera_key,
+            request.horizontal_bin_factor,
+            request.vertical_bin_factor,
+            request.mode
+        )
+        return {"message": f"Binning set to {request.horizontal_bin_factor}x{request.vertical_bin_factor} (mode: {request.mode}) for {request.camera_key}"}
+    except ValueError as e:
+        logger.error(f"Invalid binning request for {request.camera_key}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except CameraConfigurationError as e:
+        logger.error(f"Failed to set binning for {request.camera_key}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error setting binning for {request.camera_key}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 async def shutdown_server():
     logger.info("Initiating graceful shutdown...")
     close_tasks = []
     for ws in list(jpeg_stream.connections.copy()):
         try:
-            close_tasks.append(ws.close(code=1000))  # Normal closure
+            close_tasks.append(ws.close(code=1000))
             logger.debug(f"Scheduled closure for WebSocket: {id(ws)}")
         except Exception as e:
-            logger.debug(f"Skipping WebSocket closure: {e}")
+            logger.debug(f"Error closing WebSocket: {e}")
     if close_tasks:
         try:
             await asyncio.gather(*close_tasks, return_exceptions=True)
