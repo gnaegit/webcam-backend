@@ -1,6 +1,6 @@
 import io
 import asyncio
-from zipfile import ZipFile, ZIP_DEFLATED
+from zipfile import ZipFile
 import tempfile
 import shutil
 from fastapi import FastAPI, WebSocket, HTTPException, Depends
@@ -22,7 +22,6 @@ import glob
 import zipstream
 import signal
 from starlette.websockets import WebSocketState, WebSocketDisconnect
-import ids_peak_ipl as idsp_ipl
 
 try:
     from picamera2 import Picamera2
@@ -352,7 +351,7 @@ class JpegStream:
                     if not camera.acquiring:
                         camera.start_acquisition()
                     if not camera.capturing_threaded:
-                        camera.start_capturing(on_capture=lambda img: self._capture_callback(img, camera_key))
+                        camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
                 except Exception as e:
                     if "PEAK_RETURN_CODE_INVALID_HANDLE" in str(e):
                         logging.warning(f"Invalid handle for {camera_key}, attempting reinitialization")
@@ -360,7 +359,7 @@ class JpegStream:
                             raise RuntimeError(f"Failed to reinitialize CameraIDS (key: {camera_key})")
                         camera = self.cameras[camera_key]["camera"]
                         camera.start_acquisition()
-                        camera.start_capturing(on_capture=lambda img: self._capture_callback(img, camera_key))
+                        camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
 
             self.create_new_folder(camera_key)
 
@@ -421,7 +420,7 @@ class JpegStream:
                             camera.start_acquisition()
                         if not camera.capturing_threaded:
                             logging.debug(f"Starting capturing for {camera_key}, attempt {attempt + 1}")
-                            camera.start_capturing(on_capture=lambda img: self._capture_callback(img, camera_key))
+                            camera.start_capturing(on_capture_callback=lambda img: self._capture_callback(img, camera_key))
                         break
                     except Exception as e:
                         if "PEAK_RETURN_CODE_INVALID_HANDLE" in str(e):
