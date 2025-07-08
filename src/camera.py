@@ -1,8 +1,3 @@
-"""
-    Camera interface was adopted from: https://github.com/bertan-karacora/nimbro_camera_ids
-"""
-
-
 import importlib.resources as resources
 import threading
 import os
@@ -14,7 +9,6 @@ import ids_peak.ids_peak_ipl_extension as idsp_extension
 from pathlib import Path
 
 from src.utils import *
-
 
 TARGET_PIXELFORMAT = idsp_ipl.PixelFormatName_RGB8
 
@@ -92,12 +86,12 @@ class CameraIDS:
         return value
 
     def get_min(self, name):
-        min = self.nodemap.FindNode(name).Minimum()
-        return min
+        min_val = self.nodemap.FindNode(name).Minimum()
+        return min_val
 
     def get_max(self, name):
-        max = self.nodemap.FindNode(name).Maximum()
-        return max
+        max_val = self.nodemap.FindNode(name).Maximum()
+        return max_val
 
     def get_entry(self, name):
         entry = self.nodemap.FindNode(name).CurrentEntry().Value()
@@ -151,6 +145,97 @@ class CameraIDS:
 
     def reset(self):
         self.execute("ResetToFactoryDefaults")
+
+    def get_node_range(self, name: str) -> tuple[float, float, float]:
+        """
+        Retrieve the minimum, maximum, and increment for a specified node.
+        
+        Args:
+            name (str): The name of the node (e.g., 'ExposureTime', 'Gain').
+        
+        Returns:
+            tuple[float, float, float]: A tuple containing (minimum, maximum, increment).
+        
+        Raises:
+            ValueError: If the node does not exist or is not accessible.
+        """
+        if not self.has_attribute(name):
+            raise ValueError(f"Node '{name}' not found or not accessible")
+        
+        try:
+            node = self.nodemap.FindNode(name)
+            min_val = node.Minimum()
+            max_val = node.Maximum()
+            increment = node.Increment() if hasattr(node, 'HasIncrement') and node.HasIncrement() else (1.0 if name == "ExposureTime" else 0.1)
+            return (min_val, max_val, increment)
+        except Exception as e:
+            raise ValueError(f"Failed to retrieve range for node '{name}': {str(e)}")
+
+    def get_exposure_range(self) -> tuple[float, float, float]:
+        """
+        Retrieve the minimum, maximum, and increment for exposure time.
+        
+        Returns:
+            tuple[float, float, float]: A tuple containing (minimum, maximum, increment) in microseconds.
+        
+        Raises:
+            ValueError: If the ExposureTime node is not accessible.
+        """
+        return self.get_node_range("ExposureTime")
+
+    def set_exposure(self, value: float):
+        """
+        Set the exposure time to the specified value.
+        
+        Args:
+            value (float): The exposure time in microseconds.
+        
+        Raises:
+            ValueError: If the value is out of range or the ExposureTime node is not accessible.
+        """
+        if not self.has_attribute("ExposureTime"):
+            raise ValueError("ExposureTime node not found or not accessible")
+        
+        min_val, max_val, increment = self.get_exposure_range()
+        if not (min_val <= value <= max_val):
+            raise ValueError(f"Exposure time {value} out of range [{min_val}, {max_val}]")
+        
+        # Round to nearest increment
+        value = round(value / increment) * increment
+        self.set_value("ExposureTime", value)
+
+    def get_gain_range(self) -> tuple[float, float, float]:
+        """
+        Retrieve the minimum, maximum, and increment for gain.
+        
+        Returns:
+            tuple[float, float, float]: A tuple containing (minimum, maximum, increment).
+        
+        Raises:
+            ValueError: If the Gain node is not accessible.
+        """
+        return self.get_node_range("Gain")
+
+    def set_gain(self, value: float):
+        """
+        Set the gain to the specified value.
+        
+        Args:
+            value (float): The gain value.
+        
+        Raises:
+            ValueError: If the value is out of range or the Gain node is not accessible.
+        """
+        if not self.has_attribute("Gain"):
+            raise ValueError("Gain node not found or not accessible")
+        
+        min_val, max_val, increment = self.get_gain_range()
+        if not (min_val <= value <= max_val):
+            raise ValueError(f"Gain {value} out of range [{min_val}, {max_val}]")
+        
+        # Round to nearest increment
+        value = round(value / increment) * increment
+        self.set_value("Gain", value)
 
     def _open(self, device_manager, id_device):
         device_manager.Update()
@@ -283,7 +368,6 @@ class CameraIDS:
 
     def set_roi(self, x, y, width, height):
         # Get the minimum ROI and set it. After that there are no size restrictions anymore
-
         x_min = self.get_min("OffsetX")
         y_min = self.get_min("OffsetY")
         w_min = self.get_min("Width")
@@ -306,18 +390,18 @@ class CameraIDS:
             return False
         else:
             # Now, set final AOI
-            self.set_value("OffsetX",x)
-            self.set_value("OffsetY",y)
-            self.set_value("Width",width)
-            self.set_value("Height",height)
+            self.set_value("OffsetX", x)
+            self.set_value("OffsetY", y)
+            self.set_value("Width", width)
+            self.set_value("Height", height)
 
             print(x)
             print(y)
             print(width)
             print(height)
 
-            self._revoke_buffers
-            self._setup_buffers
+            self._revoke_buffers()
+            self._setup_buffers()
             return True
         
     def set_roi_max(self):
@@ -327,6 +411,7 @@ class CameraIDS:
         while not self.killed:
             image = self.capture()
             on_capture_callback(image)
+    
     @property
     def status(self):
         self.nodemap.FindNode("DeviceSelector").SetValue(0)

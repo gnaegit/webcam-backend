@@ -52,6 +52,13 @@ class IntervalRequest(BaseModel):
 class CameraSelectionRequest(BaseModel):
     camera_key: str
 
+class CameraSettingsRequest(BaseModel):
+    camera_key: str
+    auto_exposure: bool
+    exposure_time: float | None = None  # Exposure time in microseconds (for manual mode)
+    auto_gain: bool
+    gain: float | None = None  # Gain value (for manual mode)
+
 class StreamingOutput(io.BufferedIOBase):
     def __init__(self):
         super().__init__()
@@ -177,6 +184,7 @@ class JpegStream:
             try:
                 camera = CameraIDS(id_device=index)
                 camera.set_roi_max()
+                auto_manager = AutoFeatureManager(camera)
                 self.cameras[camera_key] = {
                     "camera": camera,
                     "type": camera_type,
@@ -185,12 +193,16 @@ class JpegStream:
                     "folder": None,
                     "last_save_time": 0,
                     "save_interval": 5,
-                    "auto_feature_manager": AutoFeatureManager(camera)
+                    "auto_feature_manager": auto_manager
                 }
-                self.cameras[camera_key]["auto_feature_manager"].auto_white_balance = 'on'
-                self.cameras[camera_key]["auto_feature_manager"].auto_exposure = 'on'
-                self.cameras[camera_key]["auto_feature_manager"].auto_gain = 'on'
-                logging.info(f"Initialized CameraIDS (key: {camera_key})")
+                auto_manager.auto_white_balance = 'on'
+                auto_manager.auto_exposure = 'on'
+                auto_manager.auto_gain = 'on'
+                # Log exposure and gain ranges
+                exp_min, exp_max, exp_inc = camera.get_exposure_range()
+                gain_min, gain_max, gain_inc = camera.get_gain_range()
+                logging.info(f"CameraIDS {camera_key} - Exposure range: {exp_min} to {exp_max} µs, increment: {exp_inc}")
+                logging.info(f"CameraIDS {camera_key} - Gain range: {gain_min} to {gain_max}, increment: {gain_inc}")
                 return camera
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize CameraIDS: {str(e)}")
@@ -563,8 +575,8 @@ class JpegStream:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def get_stream_status(self):
-        """Return status for all cameras."""
-        return {
+        """Return status for all cameras, including exposure and gain settings."""
+        status = {
             "cameras": {
                 camera_key: {
                     "preview_status": "running" if self.active_preview.get(camera_key, False) else "stopped",
@@ -572,12 +584,60 @@ class JpegStream:
                     "save_interval": self.cameras[camera_key]["save_interval"],
                     "current_folder": str(self.cameras[camera_key]["folder"]) if self.cameras[camera_key]["folder"] else None,
                     "camera_type": self.cameras[camera_key]["type"],
-                    "camera_index": self.cameras[camera_key]["index"]
+                    "camera_index": self.cameras[camera_key]["index"],
+                    "parameters": self.get_camera_parameters(camera_key)
                 }
                 for camera_key in self.cameras
             },
             "camera_status": self.camera_status
         }
+        return status
+    
+    def get_camera_parameters(self, camera_key: str) -> Dict[str, Dict[str, float | bool]]:
+        """Get exposure and gain parameter ranges for a specific camera."""
+        if camera_key not in self.cameras:
+            raise HTTPException(status_code=404, detail=f"Camera {camera_key} not found")
+        
+        camera_info = self.cameras[camera_key]
+        camera_type = camera_info["type"]
+        parameters = {
+            "exposure": {"auto": True, "min": None, "max": None, "increment": None, "current": None},
+            "gain": {"auto": True, "min": None, "max": None, "increment": None, "current": None}
+        }
+
+        if camera_type == "picamera":
+            # Picamera2 typically manages exposure and gain automatically
+            parameters["exposure"]["auto"] = True
+            parameters["gain"]["auto"] = True
+            logging.info(f"Parameters for {camera_key}: Picamera2 uses automatic exposure and gain")
+        elif camera_type == "cameraids":
+            camera = camera_info["camera"]
+            auto_manager = camera_info["auto_feature_manager"]
+            try:
+                # Get exposure range and current settings
+                exp_min, exp_max, exp_inc = camera.get_exposure_range()
+                parameters["exposure"] = {
+                    "auto": auto_manager.auto_exposure == 'on',
+                    "min": exp_min,
+                    "max": exp_max,
+                    "increment": exp_inc,
+                    "current": camera.get_exposure() if auto_manager.auto_exposure == 'off' else None
+                }
+                # Get gain range and current settings
+                gain_min, gain_max, gain_inc = camera.get_gain_range()
+                parameters["gain"] = {
+                    "auto": auto_manager.auto_gain == 'on',
+                    "min": gain_min,
+                    "max": gain_max,
+                    "increment": gain_inc,
+                    "current": camera.get_gain() if auto_manager.auto_gain == 'off' else None
+                }
+                logging.info(f"Retrieved parameters for {camera_key}: {parameters}")
+            except Exception as e:
+                logging.error(f"Error retrieving parameters for {camera_key}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Failed to retrieve camera parameters: {str(e)}")
+
+        return parameters
 
     async def zip_folder_generator(self, folder_path: str):
         """Generator to stream zip file creation with early browser activity."""
@@ -934,4 +994,87 @@ async def restart_server():
         return {"message": "Server restart initiated"}
     except Exception as e:
         logger.error(f"Failed to restart server: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))@app.get("/get_camera_parameters/{camera_key}")
+
+async def get_camera_parameters(camera_key: str):
+    try:
+        parameters = jpeg_stream.get_camera_parameters(camera_key)
+        return parameters
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to get parameters for {camera_key}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+@app.post("/set_camera_settings")
+async def set_camera_settings(request: CameraSettingsRequest):
+    try:
+        if request.camera_key not in jpeg_stream.cameras:
+            raise HTTPException(status_code=404, detail=f"Camera {request.camera_key} not found")
+        
+        camera_info = jpeg_stream.cameras[request.camera_key]
+        camera_type = camera_info["type"]
+        
+        if camera_type == "picamera":
+            raise HTTPException(status_code=400, detail="Manual exposure and gain settings not supported for Picamera2")
+        
+        camera = camera_info["camera"]
+        auto_manager = camera_info["auto_feature_manager"]
+        was_acquiring = camera.acquiring if camera_type == "cameraids" else camera.started
+        
+        # Stop acquisition if running to safely set parameters
+        if was_acquiring:
+            if camera_type == "cameraids":
+                camera.stop_capturing()
+                camera.stop_acquisition()
+            else:
+                camera.stop_recording()
+        
+        try:
+            # Handle exposure settings
+            auto_manager.auto_exposure = 'on' if request.auto_exposure else 'off'
+            if not request.auto_exposure and request.exposure_time is not None:
+                if not camera.has_attribute("ExposureTime"):
+                    raise HTTPException(status_code=400, detail="ExposureTime not supported by this camera")
+                exp_min, exp_max, exp_inc = camera.get_exposure_range()
+                if not (exp_min <= request.exposure_time <= exp_max):
+                    raise HTTPException(status_code=400, detail=f"Exposure time {request.exposure_time} out of range [{exp_min}, {exp_max}]")
+                # Round to nearest increment
+                request.exposure_time = round(request.exposure_time / exp_inc) * exp_inc
+                camera.set_exposure(request.exposure_time)
+                logging.info(f"Set exposure for {request.camera_key} to {request.exposure_time} µs")
+            
+            # Handle gain settings
+            auto_manager.auto_gain = 'on' if request.auto_gain else 'off'
+            if not request.auto_gain and request.gain is not None:
+                if not camera.has_attribute("Gain"):
+                    raise HTTPException(status_code=400, detail="Gain not supported by this camera")
+                gain_min, gain_max, gain_inc = camera.get_gain_range()
+                if not (gain_min <= request.gain <= gain_max):
+                    raise HTTPException(status_code=400, detail=f"Gain {request.gain} out of range [{gain_min}, {gain_max}]")
+                # Round to nearest increment
+                request.gain = round(request.gain / gain_inc) * gain_inc
+                camera.set_gain(request.gain)
+                logging.info(f"Set gain for {request.camera_key} to {request.gain}")
+        finally:
+            # Restart acquisition if it was running
+            if was_acquiring:
+                if camera_type == "cameraids":
+                    try:
+                        camera.start_acquisition()
+                        if camera_info["active_preview"] or camera_info["active_storage"]:
+                            camera.start_capturing(on_capture_callback=lambda img: jpeg_stream._capture_callback(img, request.camera_key))
+                    except Exception as e:
+                        logging.error(f"Failed to restart acquisition for {request.camera_key}: {str(e)}")
+                else:
+                    camera.start_recording(MJPEGEncoder(), FileOutput(camera_info["output"]), Quality.MEDIUM)
+        
+        await jpeg_stream.notify_clients()
+        return {"message": f"Settings updated for {request.camera_key}"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Failed to set settings for {request.camera_key}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
