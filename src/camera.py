@@ -182,6 +182,9 @@ class CameraIDS:
             ValueError: If the ExposureTime node is not accessible.
         """
         return self.get_node_range("ExposureTime")
+    
+    def get_exposure(self):
+        return self.get_value("ExposureTime")
 
     def set_exposure(self, value: float):
         """
@@ -215,6 +218,9 @@ class CameraIDS:
             ValueError: If the Gain node is not accessible.
         """
         return self.get_node_range("Gain")
+    
+    def get_gain(self):
+        return self.get_value("Gain")
 
     def set_gain(self, value: float):
         """

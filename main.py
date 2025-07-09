@@ -994,8 +994,9 @@ async def restart_server():
         return {"message": "Server restart initiated"}
     except Exception as e:
         logger.error(f"Failed to restart server: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))@app.get("/get_camera_parameters/{camera_key}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/get_camera_parameters/{camera_key}")
 async def get_camera_parameters(camera_key: str):
     try:
         parameters = jpeg_stream.get_camera_parameters(camera_key)
@@ -1004,8 +1005,7 @@ async def get_camera_parameters(camera_key: str):
         raise e
     except Exception as e:
         logger.error(f"Failed to get parameters for {camera_key}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
+        raise HTTPException(status_code=500, detail=str(e))   
 
 
 @app.post("/set_camera_settings")
@@ -1022,54 +1022,32 @@ async def set_camera_settings(request: CameraSettingsRequest):
         
         camera = camera_info["camera"]
         auto_manager = camera_info["auto_feature_manager"]
-        was_acquiring = camera.acquiring if camera_type == "cameraids" else camera.started
         
-        # Stop acquisition if running to safely set parameters
-        if was_acquiring:
-            if camera_type == "cameraids":
-                camera.stop_capturing()
-                camera.stop_acquisition()
-            else:
-                camera.stop_recording()
+        # Handle exposure settings
+        auto_manager.auto_exposure = 'on' if request.auto_exposure else 'off'
+        if not request.auto_exposure and request.exposure_time is not None:
+            if not camera.has_attribute("ExposureTime"):
+                raise HTTPException(status_code=400, detail="ExposureTime not supported by this camera")
+            exp_min, exp_max, exp_inc = camera.get_exposure_range()
+            if not (exp_min <= request.exposure_time <= exp_max):
+                raise HTTPException(status_code=400, detail=f"Exposure time {request.exposure_time} out of range [{exp_min}, {exp_max}]")
+            # Round to nearest increment
+            request.exposure_time = round(request.exposure_time / exp_inc) * exp_inc
+            camera.set_exposure(request.exposure_time)
+            logging.info(f"Set exposure for {request.camera_key} to {request.exposure_time} µs")
         
-        try:
-            # Handle exposure settings
-            auto_manager.auto_exposure = 'on' if request.auto_exposure else 'off'
-            if not request.auto_exposure and request.exposure_time is not None:
-                if not camera.has_attribute("ExposureTime"):
-                    raise HTTPException(status_code=400, detail="ExposureTime not supported by this camera")
-                exp_min, exp_max, exp_inc = camera.get_exposure_range()
-                if not (exp_min <= request.exposure_time <= exp_max):
-                    raise HTTPException(status_code=400, detail=f"Exposure time {request.exposure_time} out of range [{exp_min}, {exp_max}]")
-                # Round to nearest increment
-                request.exposure_time = round(request.exposure_time / exp_inc) * exp_inc
-                camera.set_exposure(request.exposure_time)
-                logging.info(f"Set exposure for {request.camera_key} to {request.exposure_time} µs")
-            
-            # Handle gain settings
-            auto_manager.auto_gain = 'on' if request.auto_gain else 'off'
-            if not request.auto_gain and request.gain is not None:
-                if not camera.has_attribute("Gain"):
-                    raise HTTPException(status_code=400, detail="Gain not supported by this camera")
-                gain_min, gain_max, gain_inc = camera.get_gain_range()
-                if not (gain_min <= request.gain <= gain_max):
-                    raise HTTPException(status_code=400, detail=f"Gain {request.gain} out of range [{gain_min}, {gain_max}]")
-                # Round to nearest increment
-                request.gain = round(request.gain / gain_inc) * gain_inc
-                camera.set_gain(request.gain)
-                logging.info(f"Set gain for {request.camera_key} to {request.gain}")
-        finally:
-            # Restart acquisition if it was running
-            if was_acquiring:
-                if camera_type == "cameraids":
-                    try:
-                        camera.start_acquisition()
-                        if camera_info["active_preview"] or camera_info["active_storage"]:
-                            camera.start_capturing(on_capture_callback=lambda img: jpeg_stream._capture_callback(img, request.camera_key))
-                    except Exception as e:
-                        logging.error(f"Failed to restart acquisition for {request.camera_key}: {str(e)}")
-                else:
-                    camera.start_recording(MJPEGEncoder(), FileOutput(camera_info["output"]), Quality.MEDIUM)
+        # Handle gain settings
+        auto_manager.auto_gain = 'on' if request.auto_gain else 'off'
+        if not request.auto_gain and request.gain is not None:
+            if not camera.has_attribute("Gain"):
+                raise HTTPException(status_code=400, detail="Gain not supported by this camera")
+            gain_min, gain_max, gain_inc = camera.get_gain_range()
+            if not (gain_min <= request.gain <= gain_max):
+                raise HTTPException(status_code=400, detail=f"Gain {request.gain} out of range [{gain_min}, {gain_max}]")
+            # Round to nearest increment
+            request.gain = round(request.gain / gain_inc) * gain_inc
+            camera.set_gain(request.gain)
+            logging.info(f"Set gain for {request.camera_key} to {request.gain}")
         
         await jpeg_stream.notify_clients()
         return {"message": f"Settings updated for {request.camera_key}"}
@@ -1078,3 +1056,4 @@ async def set_camera_settings(request: CameraSettingsRequest):
     except Exception as e:
         logger.error(f"Failed to set settings for {request.camera_key}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    
