@@ -24,7 +24,7 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
 1. **Clone the Repository**:
    ```bash
    git clone https://github.com/gnaegit/webcam-backend.git
-   mv webcam-backend /home/pi/webcam/webcam-backend
+   sudo mv webcam-backend /home/pi/webcam/webcam-backend
    cd /home/pi/webcam/webcam-backend
    ```
    - Note: The service expects the project in `/home/pi/webcam/webcam-backend`.
@@ -87,7 +87,7 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
    - Service configuration:
      ```ini
      [Unit]
-     Description=Fishapp FastAPI Server
+     Description=Webcam Backend FastAPI Server
      After=network.target
 
      [Service]
@@ -136,21 +136,27 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
    - **WebSocket**:
      - `/ws`: Streams camera feed and status updates.
    - **POST**:
-     - `/select_camera`: Switch camera (`{"camera_type": "picamera"}` or `{"camera_type": "cameraids"}`).
+     - `/select_camera`: Select camera (e.g., `{"camera_key": "picamera_0"}` or `{"camera_key": "cameraids_0"}`).
      - `/start_storage`: Start image storage.
      - `/stop_storage`: Stop image storage.
      - `/start_preview`: Start preview stream.
      - `/stop_preview`: Stop preview stream.
-     - `/set_interval`: Set storage interval (`{"interval": 5}`).
+     - `/set_interval`: Set storage interval (e.g., `{"camera_key": "picamera_0", "interval": 5}`).
+     - `/capture_image`: Capture a single image.
+     - `/set_camera_settings`: Configure CameraIDS exposure/gain (e.g., `{"camera_key": "cameraids_0", "auto_exposure": false, "exposure_time": 10000, "auto_gain": true}`).
+     - `/restart_server`: Restart server (requires token `supersecretkey`).
    - **GET**:
+     - `/cameras`: List available cameras.
      - `/get_camera_status`: Camera availability.
-     - `/get_stream_status`: Stream and storage status.
+     - `/get_stream_status`: Preview and storage status.
+     - `/get_camera_parameters/{camera_key}`: CameraIDS exposure/gain ranges.
      - `/explorer?path=<path>`: List directory contents.
      - `/images/<filename>`: Retrieve image.
      - `/download_zip/<folder_path>`: Download folder as ZIP.
    - **DELETE**:
      - `/delete/<filename>`: Delete file or folder.
      - `/delete_folder/<folder_path>`: Delete folder.
+     - `/remove_camera`: Remove camera instance.
 
 3. **Integration**:
    - Frontend proxies `/py/:path*` to `http://0.0.0.0:8000/:path*`.
@@ -159,6 +165,9 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
 ## Project Structure
 
 - `main.py`: FastAPI app with camera control, streaming, and file management.
+- `src/camera.py`: CameraIDS implementation.
+- `src/auto_feature_manager.py`: Auto-exposure/gain management for CameraIDS.
+- `src/utils.py`: Utility functions.
 - `requirements.txt`: Python dependencies.
 - `webcam-backend.service`: Systemd service for production.
 - `images/`: Directory for stored images (auto-created).
@@ -183,16 +192,16 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
 3. **Testing**:
    - Test endpoints:
      ```bash
-     curl -X POST http://localhost:8000/start_preview
+     curl -X POST http://localhost:8000/start_preview -H "Content-Type: application/json" -d '{"camera_key": "picamera_0"}'
      curl http://localhost:8000/get_stream_status
      ```
-   - Use a WebSocket client for `/ws`.
+   - Use a WebSocket client (e.g., `wscat`) for `/ws`.
    - Verify camera functionality and image storage.
 
 ## Production
 
 1. **Stop Development Server**:
-   - Kill `uvicorn` process.
+   - Kill `uvicorn` process: `pkill uvicorn`.
 
 2. **Start Service**:
    ```bash
@@ -212,11 +221,16 @@ The backend for a Raspberry Pi-based webcam system, built with FastAPI. It provi
   - Ensure IDS Peak and dependencies are installed.
 - **Port Conflict**:
   - Check: `sudo lsof -i :8000`.
+  - Kill conflicting processes: `sudo kill <pid>`.
 - **Camera Issues**:
   - For picamera2: Run `libcamera-hello --list-cameras`.
   - For CameraIDS: Run `ids_visioncockpit` and verify `GENICAM_GENTL64_PATH`.
 - **WebSocket Errors**:
-  - Ensure frontend proxies correctly.
+  - Ensure frontend proxies `/py/` correctly.
+  - Check WebSocket client compatibility.
+- **Image Storage Issues**:
+  - Verify `images/` permissions: `chmod -R 755 images`.
+  - Check disk space: `df -h`.
 
 ## Contributing
 
